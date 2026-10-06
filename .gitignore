@@ -1,0 +1,12 @@
+# Không đưa dữ liệu, trọng số và kết quả cá nhân lên repo.
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+.pytest_cache/
+outputs/
+hf_cache/
+*.safetensors
+*.bin
+train_dataset.csv
+dev_dataset.csv
