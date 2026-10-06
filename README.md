@@ -15,7 +15,7 @@ Repo dùng để khảo sát dữ liệu và xây dựng baseline fine-tuning LL
 
 ## Baseline LoRA trên Kaggle
 
-Baseline **thử nghiệm nội bộ**: `Qwen/Qwen3.5-9B`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Phần ngôn ngữ được nạp có **8.953.803.264 tham số**, vượt giới hạn 8B; cần đổi backbone trước khi nộp. LoRA giảm số tham số học, không giảm số tham số backbone lúc inference.
+Baseline: `Qwen/Qwen3.5-4B`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Phần ngôn ngữ được nạp có **4.205.751.296 tham số**, dưới giới hạn 8B khi dùng cùng adapter LoRA này. LoRA giảm số tham số học, không giảm số tham số backbone lúc inference. Model/tokenizer/template được cố định tại revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 
 - Chọn **GPU T4 x2**, bật **Internet**, Add Input chứa `train_dataset.csv` và `dev_dataset.csv`.
 - Loader tìm file trong toàn bộ thư mục Input, kể cả thư mục lồng nhau. Nếu có nhiều file cùng tên, truyền `--train-file` và `--dev-file` cụ thể.
@@ -23,20 +23,23 @@ Baseline **thử nghiệm nội bộ**: `Qwen/Qwen3.5-9B`, backbone FP16, **LoRA
 - Dùng chat template chính thức ở revision cố định, `enable_thinking=False`. Target JSON có `explanation=cot` trước `answer`, `unit`, `reasoning=null`. Chỉ assistant tokens được tính loss.
 - Seed **42**, batch 1, tích lũy gradient 16, 3 epoch, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`. Lưu adapter sau mỗi epoch và dùng adapter cuối; không chọn checkpoint theo điểm dev.
 - Model card khuyến nghị sampling; baseline này chọn greedy để tạo mốc đánh giá dễ tái lập, chưa khẳng định cấu hình sinh cho điểm cao nhất.
-- Một tiến trình chia 32 lớp giữa hai GPU, không DDP/`torchrun`, không cộng VRAM thành một GPU giả. Mỗi GPU chứa khoảng **8,34 GiB trọng số**, ngoài activation và adapter. Dùng gradient checkpointing và chunked cross-entropy để giảm VRAM.
+- Một tiến trình chia 32 lớp giữa hai GPU, không DDP/`torchrun`, không cộng VRAM thành một GPU giả. GPU 0 chứa khoảng **4,51 GiB**, GPU 1 khoảng **3,32 GiB trọng số**, ngoài activation và adapter. Qwen3.5-4B dùng chung trọng số embedding/output head nên cả hai được đặt trên GPU 0. Dùng gradient checkpointing và chunked cross-entropy để giảm VRAM.
 
 Sau khi clone repo về `/kaggle/working/VLSP`, mở **`02_baseline.ipynb`** và chạy lần lượt. Hoặc chạy trong các cell Kaggle:
 
 ```python
 %cd /kaggle/working/VLSP
+%pip uninstall -q -y torchao  # LoRA FP16 không cần torchao; bản cũ gây lỗi PEFT.
 %pip install -q -r requirements.txt
 ```
 
 ```python
 !python -m baseline.check
 !python -m baseline.train
-!python -m baseline.evaluate --run-dir /kaggle/working/vipra_9b_seed42
+!python -m baseline.evaluate --run-dir /kaggle/working/vipra_4b_seed42
 ```
+
+Chỉ chạy evaluate sau khi train thành công. `--run-dir` trỏ tới thư mục kết quả chứa `run.json` và `adapter/`, không phải thư mục repo; không thêm đối số đường dẫn repo vào cuối lệnh.
 
 Không cần Restart Kernel khi chỉ dùng các lệnh Python trong tiến trình con. Mỗi lần train mới phải dùng một `--output-dir` trống, ví dụ `/kaggle/working/run_02`, rồi truyền cùng đường dẫn cho evaluate.
 
@@ -74,7 +77,7 @@ evaluation/predictions.jsonl # Output từng câu, gold, thời gian và cờ đ
 evaluation/metrics.json      # Tổng số mẫu đúng và quy tắc chấm
 ```
 
-Log chỉ in các mốc bước/epoch và mỗi 25 câu dev, không có thanh phần trăm. Nếu lỗi GPU/OOM/NaN, chương trình dừng và giữ adapter các epoch đã hoàn thành; chưa hỗ trợ resume optimizer giữa epoch.
+Log ghi tên model khi nạp và mốc bắt đầu train. Khi train, in epoch, số mẫu đã xử lý và optimizer steps sau batch đầu/cuối, sau khoảng 60 giây hoặc mỗi `log_every` bước. Log thời gian chỉ cập nhật khi batch hoàn thành; một batch chậm có thể khiến khoảng chờ dài hơn 60 giây. Evaluate in mỗi 25 câu dev; không có thanh phần trăm. Nếu lỗi GPU/OOM/NaN, chương trình dừng và giữ adapter các epoch đã hoàn thành; chưa hỗ trợ resume optimizer giữa epoch.
 
 ## Code và kiểm tra
 
@@ -92,6 +95,6 @@ Log chỉ in các mốc bước/epoch và mỗi 25 câu dev, không có thanh ph
 python -m unittest discover -s tests -v
 ```
 
-Tests gồm loader giữ nguyên văn bản, Input mơ hồ, câu nhiều phần, số rất nhỏ, parser an toàn, gradient chỉ vào LoRA, loss chia đoạn bằng loss chuẩn và mapping checkpoint multimodal sang text. Các test CPU dùng model Qwen3.5 nhỏ, không huấn luyện model 9B hoặc xác nhận VRAM/tốc độ thực tế trên T4.
+Tests gồm loader giữ nguyên văn bản, Input mơ hồ, câu nhiều phần, số rất nhỏ, parser an toàn, gradient chỉ vào LoRA, loss chia đoạn bằng loss chuẩn và mapping checkpoint multimodal sang text. Các test model chạy cả head riêng và head dùng chung embedding như Qwen3.5-4B. Các test CPU dùng model Qwen3.5 nhỏ, không huấn luyện model 4B hoặc xác nhận VRAM/tốc độ thực tế trên T4.
 
-Nguồn: [Qwen3.5-9B model card](https://huggingface.co/Qwen/Qwen3.5-9B), [Qwen3.5 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen3_5), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).
+Nguồn: [Qwen3.5-4B model card](https://huggingface.co/Qwen/Qwen3.5-4B), [Qwen3.5 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen3_5), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).

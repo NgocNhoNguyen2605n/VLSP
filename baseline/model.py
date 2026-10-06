@@ -33,7 +33,7 @@ def layer_map(text_config, gpu_count):
 
 
 def backbone_plan(cfg):
-    """Tính tham số và VRAM trọng số trên meta device trước khi tải 19 GB."""
+    """Tính tham số và VRAM trọng số trên meta device trước khi tải checkpoint."""
     config = AutoConfig.from_pretrained(cfg["model_id"], revision=cfg["revision"])
     if config.model_type != "qwen3_5":
         raise ValueError("Pipeline hiện dành cho Qwen3.5 dense.")

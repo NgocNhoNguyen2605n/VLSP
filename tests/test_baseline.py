@@ -1,4 +1,4 @@
-"""Kiểm tra các điểm dễ làm lệch kết quả; không cần tải trọng số 9B."""
+"""Kiểm tra các điểm dễ làm lệch kết quả; không cần tải trọng số backbone."""
 
 import csv  # Tạo CSV mẫu có BOM và xuống dòng.
 import json  # Tạo phản hồi JSON mẫu.
@@ -111,12 +111,13 @@ class NativeModelTests(unittest.TestCase):
     """Model Qwen3.5 rất nhỏ để kiểm tra loss, gradient và mapping checkpoint."""
 
     @staticmethod
-    def config():
+    def config(tied=False):
         """Giữ cả DeltaNet/full attention nhưng dùng ít tham số để test CPU."""
         from transformers import Qwen3_5TextConfig
 
         return Qwen3_5TextConfig(
             vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+            tie_word_embeddings=tied,
             num_attention_heads=2, num_key_value_heads=1, head_dim=16,
             layer_types=["linear_attention", "full_attention"], linear_num_key_heads=2,
             linear_num_value_heads=2, linear_key_head_dim=8, linear_value_head_dim=8,
@@ -131,44 +132,48 @@ class NativeModelTests(unittest.TestCase):
         from transformers import Qwen3_5ForCausalLM
         from baseline.model import ChunkedLoss
 
-        torch.manual_seed(42)
-        base = Qwen3_5ForCausalLM(self.config())
-        base.requires_grad_(False)
-        base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, task_type="CAUSAL_LM",
-                                              target_modules=["q_proj", "in_proj_qkv", "gate_proj"]))
-        ids = torch.randint(0, 64, (1, 12))
-        labels = ids.clone()
-        labels[:, :4] = -100
-        mask = torch.ones_like(ids)
-        expected = model(input_ids=ids, attention_mask=mask, labels=labels, use_cache=False).loss
-        learner = ChunkedLoss(model, 3)
-        actual = learner(ids, mask, labels)
-        torch.testing.assert_close(actual, expected)
-        actual.backward()
-        self.assertTrue(any(parameter.grad is not None and parameter.grad.abs().sum() > 0
-                            for name, parameter in model.named_parameters() if "lora_" in name))
-        self.assertTrue(all(parameter.grad is None for name, parameter in model.named_parameters()
-                            if "lora_" not in name))
+        for tied in (False, True):
+            with self.subTest(tied_embeddings=tied):
+                torch.manual_seed(42)
+                base = Qwen3_5ForCausalLM(self.config(tied))
+                base.requires_grad_(False)
+                base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, task_type="CAUSAL_LM",
+                                                      target_modules=["q_proj", "in_proj_qkv", "gate_proj"]))
+                ids = torch.randint(0, 64, (1, 12))
+                labels = ids.clone()
+                labels[:, :4] = -100
+                mask = torch.ones_like(ids)
+                expected = model(input_ids=ids, attention_mask=mask, labels=labels, use_cache=False).loss
+                learner = ChunkedLoss(model, 3)
+                actual = learner(ids, mask, labels)
+                torch.testing.assert_close(actual, expected)
+                actual.backward()
+                self.assertTrue(any(parameter.grad is not None and parameter.grad.abs().sum() > 0
+                                    for name, parameter in model.named_parameters() if "lora_" in name))
+                self.assertTrue(all(parameter.grad is None for name, parameter in model.named_parameters()
+                                    if "lora_" not in name))
 
     def test_multimodal_checkpoint_to_text(self):
         """Nạp text backbone phải giữ đúng trọng số từ checkpoint multimodal."""
         import torch
         from transformers import Qwen3_5Config, Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 
-        full_config = Qwen3_5Config(
-            text_config=self.config().to_dict(), vision_config={
-                "depth": 1, "hidden_size": 32, "intermediate_size": 64, "num_heads": 4,
-                "out_hidden_size": 32, "num_position_embeddings": 16, "patch_size": 2,
-                "spatial_merge_size": 2, "temporal_patch_size": 1})
-        full = Qwen3_5ForConditionalGeneration(full_config)
-        with tempfile.TemporaryDirectory() as directory:
-            full.save_pretrained(directory)
-            text, info = Qwen3_5ForCausalLM.from_pretrained(
-                directory, config=full_config.text_config, output_loading_info=True)
-            self.assertFalse(info["missing_keys"])
-            for name, weight in full.model.language_model.state_dict().items():
-                torch.testing.assert_close(text.model.state_dict()[name], weight)
+        for tied in (False, True):
+            with self.subTest(tied_embeddings=tied):
+                full_config = Qwen3_5Config(
+                    text_config=self.config(tied).to_dict(), tie_word_embeddings=tied, vision_config={
+                        "depth": 1, "hidden_size": 32, "intermediate_size": 64, "num_heads": 4,
+                        "out_hidden_size": 32, "num_position_embeddings": 16, "patch_size": 2,
+                        "spatial_merge_size": 2, "temporal_patch_size": 1})
+                full = Qwen3_5ForConditionalGeneration(full_config)
+                with tempfile.TemporaryDirectory() as directory:
+                    full.save_pretrained(directory)
+                    text, info = Qwen3_5ForCausalLM.from_pretrained(
+                        directory, config=full_config.text_config, output_loading_info=True)
+                    self.assertFalse(info["missing_keys"])
+                    for name, weight in full.model.language_model.state_dict().items():
+                        torch.testing.assert_close(text.model.state_dict()[name], weight)
 
     def test_adapter_round_trip(self):
         """Adapter sau một optimizer step phải giữ dự đoán khi lưu/nạp lại."""
@@ -176,26 +181,27 @@ class NativeModelTests(unittest.TestCase):
         from peft import LoraConfig, PeftModel, get_peft_model
         from transformers import Qwen3_5ForCausalLM
 
-        torch.manual_seed(42)
-        base = Qwen3_5ForCausalLM(self.config())
-        original = {name: weight.detach().clone() for name, weight in base.state_dict().items()}
-        base.requires_grad_(False)
-        model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, task_type="CAUSAL_LM",
-                                              target_modules=["q_proj", "in_proj_qkv", "gate_proj"]))
-        ids = torch.randint(0, 64, (1, 12))
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.001)
-        model(input_ids=ids, labels=ids, use_cache=False).loss.backward()
-        optimizer.step()
-        model.eval()
-        expected = model(input_ids=ids, use_cache=False).logits.detach()
-        with tempfile.TemporaryDirectory() as directory:
-            model.save_pretrained(directory)
-            restored_base = Qwen3_5ForCausalLM(self.config())
-            restored_base.load_state_dict(original)
-            restored = PeftModel.from_pretrained(restored_base, directory).eval()
-            actual = restored(input_ids=ids, use_cache=False).logits.detach()
-            torch.testing.assert_close(actual, expected)
-
+        for tied in (False, True):
+            with self.subTest(tied_embeddings=tied):
+                torch.manual_seed(42)
+                base = Qwen3_5ForCausalLM(self.config(tied))
+                original = {name: weight.detach().clone() for name, weight in base.state_dict().items()}
+                base.requires_grad_(False)
+                model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, task_type="CAUSAL_LM",
+                                                      target_modules=["q_proj", "in_proj_qkv", "gate_proj"]))
+                ids = torch.randint(0, 64, (1, 12))
+                optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.001)
+                model(input_ids=ids, labels=ids, use_cache=False).loss.backward()
+                optimizer.step()
+                model.eval()
+                expected = model(input_ids=ids, use_cache=False).logits.detach()
+                with tempfile.TemporaryDirectory() as directory:
+                    model.save_pretrained(directory)
+                    restored_base = Qwen3_5ForCausalLM(self.config(tied))
+                    restored_base.load_state_dict(original)
+                    restored = PeftModel.from_pretrained(restored_base, directory).eval()
+                    actual = restored(input_ids=ids, use_cache=False).logits.detach()
+                    torch.testing.assert_close(actual, expected)
 
 if __name__ == "__main__":
     unittest.main()

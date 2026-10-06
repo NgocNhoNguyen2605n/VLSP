@@ -4,6 +4,7 @@ from .runtime import arguments, environment, read_config, save_json, setup_seed 
 
 import hashlib  # Hash template để đối chiếu train/inference.
 import math  # Tính số optimizer steps và scheduler.
+import time  # Giới hạn tần suất log theo thời gian thực.
 from functools import partial  # Cố định pad token cho collator.
 from pathlib import Path  # Lưu adapter vào Kaggle Working.
 
@@ -32,6 +33,7 @@ def train(cfg):
                         collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id))
     print(f"Dữ liệu: train={len(features)}, dev={len(splits['dev'])}; "
           f"bỏ mẫu thiếu answer={data_info['train']['skipped_ids']}; max dev={dev_max} token.", flush=True)
+    print(f"Đang nạp {cfg['model_id']} FP16 và gắn LoRA...", flush=True)
     model, plan = load_model(cfg, training=True)
     print(f"LoRA FP16: backbone={plan['base_parameters']:,}; "
           f"tham số học={plan['trainable_parameters']:,}; GPU={cfg['gpu_count']}; seed=42.", flush=True)
@@ -54,6 +56,9 @@ def train(cfg):
                 "selection": "final epoch; dev không dùng để chọn checkpoint"}
     save_json(output / "run.json", manifest)
     updates, skipped_updates, history = 0, 0, []
+    last_report, reported_updates = time.monotonic(), 0
+    print(f"Bắt đầu train: {cfg['epochs']} epoch | {len(features)} mẫu/epoch | "
+          f"Train step 0/{total_steps}.", flush=True)
     for epoch in range(1, cfg["epochs"] + 1):
         learner.train()
         optimizer.zero_grad(set_to_none=True)
@@ -85,11 +90,17 @@ def train(cfg):
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 updates += 1
-                if updates % cfg["log_every"] == 0 or updates == total_steps:
-                    print(f"Train step {updates}/{total_steps} | loss={epoch_sum / epoch_tokens:.4f}", flush=True)
+            # Log khi xong batch đầu/cuối, sau 60 giây hoặc đủ số bước đã cấu hình.
+            now = time.monotonic()
+            if (index == 0 or index + 1 == len(loader) or now - last_report >= 60
+                    or updates - reported_updates >= cfg["log_every"]):
+                processed = min((index + 1) * cfg["batch_size"], len(features))
+                print(f"Epoch {epoch}/{cfg['epochs']} | mẫu {processed}/{len(features)} | "
+                      f"Train step {updates}/{total_steps} | loss={epoch_sum / epoch_tokens:.4f}", flush=True)
+                last_report, reported_updates = now, updates
         history.append({"epoch": epoch, "loss": epoch_sum / epoch_tokens,
                         "skipped_optimizer_steps": skipped_updates})
-        # Mỗi epoch lưu adapter nhỏ; không sao chép 9B trọng số backbone.
+        # Mỗi epoch lưu adapter nhỏ; không sao chép trọng số backbone.
         model.save_pretrained(output / f"epoch-{epoch}")
         save_json(output / "train_log.json", history)
         print(f"Epoch {epoch}/{cfg['epochs']} hoàn tất | loss={history[-1]['loss']:.4f}", flush=True)
