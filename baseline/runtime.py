@@ -39,6 +39,11 @@ def read_config(args):
             raise ValueError(f"{name} phải lớn hơn 0.")
     if cfg["rtol"] < 0 or cfg["atol"] < 0:
         raise ValueError("Dung sai không được âm.")
+    if not 0 < cfg.get("fp16_init_scale", 128.0) < float("inf"):
+        raise ValueError("fp16_init_scale phải dương và hữu hạn.")
+    skips = cfg.get("max_consecutive_skips", 8)
+    if not isinstance(skips, int) or skips <= 0:
+        raise ValueError("max_consecutive_skips phải là số nguyên dương.")
     return cfg
 
 

@@ -16,6 +16,23 @@ from .data import collate_batch, encode_sample, load_data  # Loader và assistan
 from .model import ChunkedLoss, load_model, load_tokenizer  # Backbone FP16 và adapter LoRA.
 
 
+def optimizer_step(params, optimizer, scaler, scheduler, max_norm):
+    """Bỏ bước có gradient tràn số; scheduler chỉ chạy khi trọng số được cập nhật."""
+    scaler.unscale_(optimizer)
+    norm = torch.nn.utils.clip_grad_norm_(params, max_norm)
+    old_scale = scaler.get_scale()
+    scaler.step(optimizer)
+    scaler.update()
+    scale = scaler.get_scale()
+    skipped = scale < old_scale
+    optimizer.zero_grad(set_to_none=True)
+    if not skipped:
+        if not torch.isfinite(norm):
+            raise FloatingPointError("Gradient norm không hữu hạn dù GradScaler không báo overflow.")
+        scheduler.step()
+    return skipped, old_scale, scale
+
+
 def train(cfg):
     """Train số epoch cố định; không chọn model theo điểm dev để tránh chọn may mắn."""
     setup_seed(cfg["seed"])
@@ -47,15 +64,19 @@ def train(cfg):
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=math.ceil(total_steps * cfg["warmup_ratio"]),
         num_training_steps=total_steps)
-    scaler = torch.amp.GradScaler("cuda")
+    # Scale mặc định 65536 có thể gây nhiều overflow lúc đầu trên backbone FP16.
+    scaler = torch.amp.GradScaler("cuda", init_scale=cfg.get("fp16_init_scale", 128.0))
     learner = ChunkedLoss(model, cfg["loss_chunk_size"])
     input_device = model.get_input_embeddings().weight.device
     manifest = {"config": cfg, "data": data_info, "environment": environment(), "model": plan,
                 "template_sha256": hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
                 "effective_batch_size": cfg["batch_size"] * accumulation,
-                "selection": "final epoch; dev không dùng để chọn checkpoint"}
+                "selection": "final epoch; dev không dùng để chọn checkpoint",
+                "training_status": "running"}
     save_json(output / "run.json", manifest)
     updates, skipped_updates, history = 0, 0, []
+    consecutive_skips, successful_updates = 0, 0
+    max_skips = cfg.get("max_consecutive_skips", 8)
     last_report, reported_updates = time.monotonic(), 0
     print(f"Bắt đầu train: {cfg['epochs']} epoch | {len(features)} mẫu/epoch | "
           f"Train step 0/{total_steps}.", flush=True)
@@ -77,18 +98,20 @@ def train(cfg):
             epoch_tokens += tokens
             scaler.scale(loss / group_size).backward()
             if (index + 1) % accumulation == 0 or index + 1 == len(loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params, cfg["max_grad_norm"])
-                old_scale = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                if scaler.get_scale() < old_scale:
+                skipped, old_scale, scale = optimizer_step(
+                    params, optimizer, scaler, scheduler, cfg["max_grad_norm"])
+                if skipped:
                     skipped_updates += 1
-                    if skipped_updates > 5:
-                        raise FloatingPointError("FP16 bỏ hơn 5 optimizer steps; cần kiểm tra độ ổn định.")
+                    consecutive_skips += 1
+                    print(f"FP16 overflow: scale {old_scale:g} -> {scale:g} | "
+                          f"bỏ {skipped_updates} bước | liên tiếp {consecutive_skips}/{max_skips}.", flush=True)
+                    if consecutive_skips >= max_skips:
+                        raise FloatingPointError(
+                            f"Gradient không hữu hạn {max_skips} bước liên tiếp dù scale đã giảm "
+                            f"còn {scale:g}; cần kiểm tra phép toán FP16, không tiếp tục chấm dev.")
                 else:
-                    scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                    successful_updates += 1
+                    consecutive_skips = 0
                 updates += 1
             # Log khi xong batch đầu/cuối, sau 60 giây hoặc đủ số bước đã cấu hình.
             now = time.monotonic()
@@ -96,16 +119,24 @@ def train(cfg):
                     or updates - reported_updates >= cfg["log_every"]):
                 processed = min((index + 1) * cfg["batch_size"], len(features))
                 print(f"Epoch {epoch}/{cfg['epochs']} | mẫu {processed}/{len(features)} | "
-                      f"Train step {updates}/{total_steps} | loss={epoch_sum / epoch_tokens:.4f}", flush=True)
+                      f"Train step {updates}/{total_steps} | cập nhật={successful_updates} | "
+                      f"bỏ={skipped_updates} | loss={epoch_sum / epoch_tokens:.4f}", flush=True)
                 last_report, reported_updates = now, updates
         history.append({"epoch": epoch, "loss": epoch_sum / epoch_tokens,
-                        "skipped_optimizer_steps": skipped_updates})
+                        "skipped_optimizer_steps": skipped_updates,
+                        "successful_optimizer_steps": successful_updates,
+                        "grad_scale": scaler.get_scale()})
+        if successful_updates == 0:
+            raise FloatingPointError("Chưa có bước cập nhật trọng số thành công; không lưu adapter để chấm.")
         # Mỗi epoch lưu adapter nhỏ; không sao chép trọng số backbone.
         model.save_pretrained(output / f"epoch-{epoch}")
         save_json(output / "train_log.json", history)
         print(f"Epoch {epoch}/{cfg['epochs']} hoàn tất | loss={history[-1]['loss']:.4f}", flush=True)
     model.save_pretrained(output / "adapter")
     tokenizer.save_pretrained(output / "adapter")
+    manifest.update(training_status="complete", successful_optimizer_steps=successful_updates,
+                    skipped_optimizer_steps=skipped_updates)
+    save_json(output / "run.json", manifest)
     print(f"Đã lưu adapter: {output / 'adapter'}", flush=True)
 
 

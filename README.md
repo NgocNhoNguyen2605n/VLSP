@@ -21,7 +21,7 @@ Baseline: `Qwen/Qwen3.5-4B`, backbone FP16, **LoRA thuần**, không lượng t�
 - Loader tìm file trong toàn bộ thư mục Input, kể cả thư mục lồng nhau. Nếu có nhiều file cùng tên, truyền `--train-file` và `--dev-file` cụ thể.
 - Không sửa CSV, không làm sạch ký tự, không sửa đáp án/CoT, không loại câu trùng. Mẫu train thiếu answer (`LD111`) bị bỏ và ghi ID trong manifest: **676 train, 339 dev**.
 - Dùng chat template chính thức ở revision cố định, `enable_thinking=False`. Target JSON có `explanation=cot` trước `answer`, `unit`, `reasoning=null`. Chỉ assistant tokens được tính loss.
-- Seed **42**, batch 1, tích lũy gradient 16, 3 epoch, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`. Lưu adapter sau mỗi epoch và dùng adapter cuối; không chọn checkpoint theo điểm dev.
+- Seed **42**, batch 4, tích lũy gradient 2 (effective batch 8), 3 epoch, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`. Lưu adapter sau mỗi epoch và dùng adapter cuối; không chọn checkpoint theo điểm dev.
 - Model card khuyến nghị sampling; baseline này chọn greedy để tạo mốc đánh giá dễ tái lập, chưa khẳng định cấu hình sinh cho điểm cao nhất.
 - Một tiến trình chia 32 lớp giữa hai GPU, không DDP/`torchrun`, không cộng VRAM thành một GPU giả. GPU 0 chứa khoảng **4,51 GiB**, GPU 1 khoảng **3,32 GiB trọng số**, ngoài activation và adapter. Qwen3.5-4B dùng chung trọng số embedding/output head nên cả hai được đặt trên GPU 0. Dùng gradient checkpointing và chunked cross-entropy để giảm VRAM.
 
@@ -42,6 +42,8 @@ Sau khi clone repo về `/kaggle/working/VLSP`, mở **`02_baseline.ipynb`** và
 Chỉ chạy evaluate sau khi train thành công. `--run-dir` trỏ tới thư mục kết quả chứa `run.json` và `adapter/`, không phải thư mục repo; không thêm đối số đường dẫn repo vào cuối lệnh.
 
 Không cần Restart Kernel khi chỉ dùng các lệnh Python trong tiến trình con. Mỗi lần train mới phải dùng một `--output-dir` trống, ví dụ `/kaggle/working/run_02`, rồi truyền cùng đường dẫn cho evaluate.
+
+FP16 dùng GradScaler với scale ban đầu **128**; overflow làm giảm scale và bỏ bước đó. Scheduler chỉ tiến khi cập nhật thành công. Log/manifest ghi riêng số bước thành công và bị bỏ; dừng nếu **8 bước liên tiếp** vẫn overflow hoặc loss NaN/Inf. Scale thấp giảm nguy cơ overflow lúc đầu, chưa đảm bảo model chạy ổn định trên T4.
 
 Đổi cấu hình trong `configs/baseline.json`. Dữ liệu local có thể chạy check bằng:
 
@@ -77,7 +79,7 @@ evaluation/predictions.jsonl # Output từng câu, gold, thời gian và cờ đ
 evaluation/metrics.json      # Tổng số mẫu đúng và quy tắc chấm
 ```
 
-Log ghi tên model khi nạp và mốc bắt đầu train. Khi train, in epoch, số mẫu đã xử lý và optimizer steps sau batch đầu/cuối, sau khoảng 60 giây hoặc mỗi `log_every` bước. Log thời gian chỉ cập nhật khi batch hoàn thành; một batch chậm có thể khiến khoảng chờ dài hơn 60 giây. Evaluate in mỗi 25 câu dev; không có thanh phần trăm. Nếu lỗi GPU/OOM/NaN, chương trình dừng và giữ adapter các epoch đã hoàn thành; chưa hỗ trợ resume optimizer giữa epoch.
+Log ghi tên model khi nạp và mốc bắt đầu train. Khi train, in epoch, số mẫu đã xử lý và optimizer steps sau batch đầu/cuối, sau khoảng 60 giây hoặc mỗi `log_every` bước. Log thời gian chỉ cập nhật khi batch hoàn thành; một batch chậm có thể khiến khoảng chờ dài hơn 60 giây. Evaluate in mỗi 25 câu dev; không có thanh phần trăm. Evaluate yêu cầu adapter cuối và trạng thái train hoàn tất. Nếu lỗi GPU/OOM/NaN, chương trình dừng và giữ adapter các epoch đã hoàn thành; chưa hỗ trợ resume optimizer giữa epoch.
 
 ## Code và kiểm tra
 

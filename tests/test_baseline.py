@@ -107,6 +107,53 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(messages[-1]["content"], "Điện dung bằng bao nhiêu?")
 
 
+class TrainingTests(unittest.TestCase):
+    """Kiểm tra overflow thực sự với GradScaler CPU và chặn chấm run chưa hoàn tất."""
+
+    def test_overflow_then_recovery(self):
+        """Overflow không đổi trọng số/scheduler; gradient hữu hạn cập nhật bình thường."""
+        import torch
+        from baseline.train import optimizer_step
+
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100)
+        scaler = torch.amp.GradScaler("cpu", init_scale=128.0)
+        original = parameter.detach().clone()
+        old_epoch = scheduler.last_epoch
+        scaler.scale(parameter.square().sum()).backward()
+        parameter.grad.fill_(float("inf"))
+        skipped, old_scale, scale = optimizer_step([parameter], optimizer, scaler, scheduler, 1.0)
+        self.assertTrue(skipped)
+        self.assertEqual((old_scale, scale), (128.0, 64.0))
+        torch.testing.assert_close(parameter, original)
+        self.assertEqual(scheduler.last_epoch, old_epoch)
+        self.assertIsNone(parameter.grad)
+
+        scaler.scale(parameter.square().sum()).backward()
+        skipped, _, scale = optimizer_step([parameter], optimizer, scaler, scheduler, 1.0)
+        self.assertFalse(skipped)
+        self.assertEqual(scale, 64.0)
+        self.assertLess(parameter.item(), original.item())
+        self.assertEqual(scheduler.last_epoch, old_epoch + 1)
+
+    def test_evaluate_requires_completed_training(self):
+        """Sai thư mục hoặc run đang dở phải dừng trước khi tải backbone lên GPU."""
+        from baseline.evaluate import evaluate
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            with self.assertRaisesRegex(FileNotFoundError, "--run-dir"):
+                evaluate(path)
+            (path / "run.json").write_text('{"training_status":"running"}')
+            with self.assertRaisesRegex(RuntimeError, "adapter cuối"):
+                evaluate(path)
+            (path / "adapter").mkdir()
+            (path / "adapter" / "adapter_config.json").write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, "Train chưa hoàn tất"):
+                evaluate(path)
+
+
 class NativeModelTests(unittest.TestCase):
     """Model Qwen3.5 rất nhỏ để kiểm tra loss, gradient và mapping checkpoint."""
 
