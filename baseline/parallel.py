@@ -268,7 +268,7 @@ def train_parallel(cfg, device):
     tokenizer = load_tokenizer(cfg)
     features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in rows]
     validation_features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in validation]
-    validation_loader = DataLoader(validation_features, batch_size=cfg["batch_size"], shuffle=False,
+    validation_loader = DataLoader(validation_features, batch_size=cfg.get("validation_batch_size", 4), shuffle=False,
                                   num_workers=0, collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id))
     mesh = init_device_mesh(device.type, (world,))
     model = plan = root = None

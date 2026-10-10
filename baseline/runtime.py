@@ -43,6 +43,9 @@ def read_config(args):
             raise ValueError(f"{name} phải lớn hơn 0.")
     if cfg["rtol"] < 0 or cfg["atol"] < 0:
         raise ValueError("Dung sai không được âm.")
+    cfg.setdefault("validation_batch_size", 4)
+    if type(cfg["validation_batch_size"]) is not int or cfg["validation_batch_size"] <= 0:
+        raise ValueError("validation_batch_size phải là số nguyên dương.")
     if not 0 < cfg.get("fp16_init_scale", 128.0) < float("inf"):
         raise ValueError("fp16_init_scale phải dương và hữu hạn.")
     skips = cfg.get("max_consecutive_skips", 8)
@@ -83,7 +86,7 @@ def print_training_config(cfg, target_modules, world_size=1):
         lines.extend([
             f"Split: validation_fraction={cfg.get('validation_fraction', 0.1):g} | "
             f"split_seed={cfg.get('split_seed', 42)} | chọn best epoch theo validation answer+unit accuracy",
-            f"Validation: greedy | max_new_tokens={cfg['max_new_tokens']} | "
+            f"Validation: greedy | generation batch={cfg.get('validation_batch_size', 4)} | max_new_tokens={cfg['max_new_tokens']} | "
             f"timeout_seconds={cfg['timeout_seconds']} | rtol={cfg['rtol']:g} | atol={cfg['atol']:g}",
         ])
     elif stage == "final":

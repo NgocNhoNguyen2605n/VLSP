@@ -235,27 +235,32 @@ def fsdp_worker(rank, directory, mode):
         cfg = read_config(arguments("test").parse_args(["--config", str(root / 'config.json')]))
         initialized = []
         from baseline.model import load_model
-        from baseline.evaluate import generate_once
+        from baseline.evaluate import generate_batch
         def fresh(config, **kwargs):
             model, plan = load_model(config, **kwargs)
             assert kwargs == {"training": True, "cpu_init": True}
             assert all(torch.count_nonzero(p) == 0 for name, p in model.named_parameters() if 'lora_B' in name)
             initialized.append(config['training_stage'])
             return model, plan
-        generated, token_counts = [], []
-        def generation(model, tokenizer, question, config):
+        generated, token_counts, batch_sizes = [], [], []
+        validation_count = len(json.loads(Path(cfg['split_file']).read_text())['validation_ids'])
+        def generation(model, tokenizer, questions, config):
             # Chạy greedy thật qua FSDP/KV cache/synced_gpus; metric giả để chọn epoch 3 chắc chắn.
             with patch("baseline.evaluate.synchronize"):
                 generation_cfg = {**config, 'timeout_seconds': 0 if rank == 0 else 600} if not generated else config
-                raw, elapsed, count, finished = generate_once(model, tokenizer, question, generation_cfg)
-            generated.append(raw)
-            token_counts.append(count)
-            epoch = (len(generated) - 1) // 2 + 1
+                outputs = generate_batch(model, tokenizer, questions, generation_cfg)
+            epoch = len(generated) // validation_count + 1
+            batch_sizes.append(len(questions))
             answer = '1' if epoch == 3 else '99'
-            return json.dumps({'answer': answer, 'unit': 'V', 'explanation': 'Giải'}), 0.1, count, finished
+            results = []
+            for raw, elapsed, count, finished in outputs:
+                generated.append(raw)
+                token_counts.append(count)
+                results.append((json.dumps({'answer': answer, 'unit': 'V', 'explanation': 'Giải'}), 0.1, count, finished))
+            return results
         with patch("baseline.parallel.load_tokenizer", return_value=ToyTokenizer()), \
              patch("baseline.parallel.load_model", fresh), \
-             patch("baseline.validation.generate_once", generation), \
+             patch("baseline.validation.generate_batch", generation), \
              patch("torch.distributed.reduce_scatter_tensor", side_effect=AssertionError('FSDP không được reduce-scatter LoRA')):
             train_parallel(cfg, torch.device('cpu'))
             best = json.loads((Path(cfg['output_dir']) / 'best_checkpoint.json').read_text())
@@ -263,10 +268,12 @@ def fsdp_worker(rank, directory, mode):
             final.pop('split_file')
             train_parallel(final, torch.device('cpu'))
         assert initialized == ['search', 'final']
-        assert len(generated) == 10
+        assert len(generated) == 5 * validation_count
+        expected_batches = [min(4, validation_count - start) for start in range(0, validation_count, 4)]
+        assert batch_sizes == expected_batches * 5
         all_generated = [None, None]
         dist.all_gather_object(all_generated, generated)
-        assert all_generated[0][1:] == all_generated[1][1:]
+        assert all_generated[0][batch_sizes[0]:] == all_generated[1][batch_sizes[0]:]
         counts = [None, None]
         dist.all_gather_object(counts, token_counts)
         assert counts[0][0] == 1 and counts[1][0] == 2  # Deadline khác nhau vẫn không deadlock.
@@ -390,11 +397,12 @@ class ParallelTests(unittest.TestCase):
             Qwen2ForCausalLM(Qwen2Config(vocab_size=16, hidden_size=16, intermediate_size=24,
                 num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=1,
                 max_position_embeddings=128, use_cache=False)).save_pretrained(root / 'backbone')
+            sample_count = 43 if batch_size == 4 else 13
             with (root / 'train_dataset.csv').open('w', newline='', encoding='utf-8') as handle:
                 writer = csv.DictWriter(handle, fieldnames=['id', 'question', 'cot', 'answer', 'unit'])
                 writer.writeheader()
                 writer.writerows([{'id': str(i), 'question': f'Câu hỏi {i}', 'cot': 'Giải', 'answer': '1', 'unit': 'V'}
-                                  for i in range(13)])
+                                  for i in range(sample_count)])
             cfg = json.loads(Path('configs/baseline.json').read_text())
             cfg.update(model_id=str(root / 'backbone'), revision='local-test', data_root=str(root),
                        output_dir=str(root / 'search'), max_length=32, lora_rank=2, lora_alpha=4,
@@ -410,13 +418,14 @@ class ParallelTests(unittest.TestCase):
             mp.spawn(fsdp_worker, args=(directory, 'training'), nprocs=2, join=True)
             search = json.loads((root / 'search/run.json').read_text())
             final = json.loads((root / 'final/run.json').read_text())
-            self.assertEqual((search['training_samples'], final['training_samples']), (11, 13))
+            self.assertEqual((search['training_samples'], final['training_samples']), (len(fit), sample_count))
             self.assertEqual((search['effective_batch_size'], final['effective_batch_size']), (8 * batch_size,) * 2)
             self.assertEqual((search['config']['epochs'], final['config']['epochs']), (5, 3))
             self.assertEqual(search['model']['parallelism'], 'FSDP2')
             self.assertEqual(search['model']['world_size'], 2)
             self.assertEqual(final['training_status'], 'complete')
-            self.assertEqual(final['successful_optimizer_steps'], 6 if batch_size == 1 else 3)
+            import math
+            self.assertEqual(final['successful_optimizer_steps'], 3 * math.ceil(sample_count / (8 * batch_size)))
             self.assertEqual(search['model']['activation_checkpointing'], 'inside FSDP; non-reentrant')
             self.assertTrue(search['group_by_length'])
             self.assertTrue(search['model']['replicated_lora'])

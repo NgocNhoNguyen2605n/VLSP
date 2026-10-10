@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from .evaluate import generate_once
+from .evaluate import generate_batch
 from .metrics import parse_prediction, score_prediction
 from .runtime import save_json
 from .progress import BatchProgress
@@ -25,6 +25,9 @@ def checkpoint_rank(result):
 
 def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, primary=True):
     """Loss có trọng số token; sinh một lần mỗi câu và so đáp án + đơn vị."""
+    batch_size = cfg.get("validation_batch_size", 4)
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("validation_batch_size phải là số nguyên dương.")
     learner.eval()
     model = learner.model
     device = model.get_input_embeddings().weight.device
@@ -54,28 +57,36 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
               "over_time": 0, "p1_estimate": 0}
     previous_cache = model.config.use_cache
     model.config.use_cache = True
+    result.update(generation_batch_size=batch_size,
+                  generation_timing="seconds là thời gian chung của batch, không chia cho số câu")
     try:
         handle_context = ((result_dir / "predictions.jsonl").open("w", encoding="utf-8")
                           if primary else contextlib.nullcontext(None))
-        # Generation hiện tại mỗi batch chỉ có một câu; cả hai rank cùng tham gia.
-        with handle_context as handle, BatchProgress(f"Validation đáp án epoch {epoch}", len(rows), enabled=primary) as progress:
-            for index, row in enumerate(rows, start=1):
-                raw, elapsed, token_count, finished = generate_once(model, tokenizer, row["question"], cfg)
-                prediction = parse_prediction(raw)
-                score = score_prediction(prediction, row, cfg["rtol"], cfg["atol"])
-                over_time = elapsed > cfg["timeout_seconds"]
-                result["content_tolerant"] += score["tolerant"]
-                result["content_exact"] += score["exact"]
-                result["valid_json"] += prediction is not None
-                result["over_time"] += over_time
-                result["p1_estimate"] += score["tolerant"] and not over_time
-                if handle is not None:
-                    handle.write(json.dumps({"query_id": row["id"], "prediction": prediction,
-                                             "raw_output": raw, "gold_answer": row["answer"],
-                                             "gold_unit": row["unit"], "score": score,
-                                             "seconds": elapsed, "generated_tokens": token_count,
-                                             "finished": finished, "over_time": over_time}, ensure_ascii=False) + "\n")
-                    handle.flush()
+        # Hai rank phải cùng sinh đúng batch, kể cả batch cuối thiếu 4 câu.
+        with handle_context as handle, BatchProgress(f"Validation đáp án epoch {epoch}", math.ceil(len(rows) / batch_size), enabled=primary) as progress:
+            for index, start in enumerate(range(0, len(rows), batch_size), start=1):
+                batch_rows = rows[start:start + batch_size]
+                outputs = generate_batch(model, tokenizer, [row["question"] for row in batch_rows], cfg)
+                if len(outputs) != len(batch_rows):
+                    raise RuntimeError("Generation trả sai số câu trong batch validation.")
+                for row, (raw, elapsed, token_count, finished) in zip(batch_rows, outputs):
+                    prediction = parse_prediction(raw)
+                    score = score_prediction(prediction, row, cfg["rtol"], cfg["atol"])
+                    over_time = elapsed > cfg["timeout_seconds"]
+                    result["content_tolerant"] += score["tolerant"]
+                    result["content_exact"] += score["exact"]
+                    result["valid_json"] += prediction is not None
+                    result["over_time"] += over_time
+                    result["p1_estimate"] += score["tolerant"] and not over_time
+                    if handle is not None:
+                        handle.write(json.dumps({"query_id": row["id"], "prediction": prediction,
+                                                 "raw_output": raw, "gold_answer": row["answer"],
+                                                 "gold_unit": row["unit"], "score": score,
+                                                 "seconds": elapsed, "generated_tokens": token_count,
+                                                 "finished": finished, "over_time": over_time,
+                                                 "generation_batch": index,
+                                                 "generation_batch_size": len(batch_rows)}, ensure_ascii=False) + "\n")
+                        handle.flush()
                 progress.update(index)
     finally:
         model.config.use_cache = previous_cache

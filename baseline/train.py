@@ -60,7 +60,7 @@ def train(cfg):
     loader = DataLoader(features, batch_size=cfg["batch_size"], shuffle=True,
                         generator=torch.Generator().manual_seed(cfg["seed"]), num_workers=0,
                         collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id))
-    validation_loader = DataLoader(validation_features, batch_size=cfg["batch_size"], shuffle=False,
+    validation_loader = DataLoader(validation_features, batch_size=cfg.get("validation_batch_size", 4), shuffle=False,
                                   num_workers=0, collate_fn=partial(
                                       collate_batch, pad_token_id=tokenizer.pad_token_id))
     verbose = cfg.get("verbose_logging", False)
@@ -186,7 +186,7 @@ def main():
     if "training_stage" not in cfg:
         # Notebook cũ gọi train trực tiếp vẫn phải chạy quy trình chọn best epoch.
         from .experiment import run_experiment
-        print("Train mặc định: chia 90/10, chọn best epoch rồi retrain từ backbone gốc.", flush=True)
+        print("Train mặc định: chia 90/10 và chọn best epoch; retrain được gọi riêng sau khi chọn cấu hình.", flush=True)
         run_experiment(cfg)
         return
     if cfg.get("parallel_training") == "fsdp":

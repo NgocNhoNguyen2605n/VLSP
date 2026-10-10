@@ -16,7 +16,7 @@ Repo dùng để khảo sát dữ liệu và xây dựng baseline fine-tuning LL
 
 Baseline: `Qwen/Qwen2.5-Math-7B-Instruct`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Model/tokenizer/template được cố định tại revision `ef9926d75ab1d54532f6a30dd5e760355eb9aa4d`.
 
-- Train **5 epoch với seed 42**, chọn epoch có điểm validation cao nhất. Batch 4/GPU, tích lũy gradient 4/GPU trên 2 GPU (effective batch 32), LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
+- Train **5 epoch với seed 42**, chọn epoch có điểm validation cao nhất. Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU (effective batch 16), LoRA rank 16/alpha 32/dropout 0, learning rate `1e-3`. Validation generation batch 4.
 - Backbone có **7.615.616.512 tham số**, dưới giới hạn 8B. Trọng số FP16 khoảng **14,19 GiB tổng**. Training dùng **FSDP2 chia backbone frozen**, hai T4 xử lý các batch khác nhau đồng thời. Head frozen và LoRA được nhân bản; riêng trọng số backbone khoảng **7,60 GiB/GPU**. LoRA FP32 + gradient + hai trạng thái AdamW khoảng **0,60 GiB/GPU**, chưa gồm activation và buffer giao tiếp. Micro-batch 4/GPU; activation checkpointing và chunked loss giảm VRAM; vẫn cần đo VRAM thực tế trên Kaggle.
 - Dùng chat template Qwen2.5-Math chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Sinh greedy một lần mỗi câu; không dùng công cụ tính toán bên ngoài.
 - Model card chủ yếu hỗ trợ toán tiếng Anh/Trung. Khả năng giải vật lý tiếng Việt cần được đo trên dev; chưa có kết quả để khẳng định cải thiện so với backbone trước.
@@ -37,19 +37,25 @@ Sau khi clone repo về chạy lần lượt:
 
 ```python
 !python -m baseline.check
-!python -m baseline.experiment
+!python -m baseline.experiment  # Chỉ search, không tự retrain.
+```
+
+Sau khi so sánh `selection.json` của các lần search, chỉ retrain thư mục của cấu hình đã chọn:
+
+```python
+!python -m baseline.experiment --retrain-from /kaggle/working/vipra_qwen25_math_7b_5epochs
 !python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen25_math_7b_5epochs/final
 ```
 
 ## Chia 90/10, chọn checkpoint và train cuối
 
 1. Chỉ chia `train_dataset.csv`: bỏ mẫu thiếu answer theo cấu hình, rồi tạo **608 mẫu train nội bộ / 68 mẫu validation** từ 676 mẫu hợp lệ hiện tại. Split cố định bằng `split_seed=42`, dùng để chấm cả 5 epoch. Câu hỏi trùng sau NFC/khoảng trắng được giữ cùng phía; tỷ lệ có thể xấp xỉ 90/10 khi không thể chia nguyên nhóm đúng số mẫu.
-2. Một run bắt đầu từ backbone gốc và LoRA mới, train đủ **5 epoch với seed 42**. Sau **mỗi epoch**, tính validation loss và sinh greedy một lần mỗi câu validation, lưu prediction cùng điểm đáp án/đơn vị.
+2. Một run bắt đầu từ backbone gốc và LoRA mới, train đủ **5 epoch với seed 42**. Sau **mỗi epoch**, tính validation loss và sinh greedy một lần mỗi câu validation theo batch 4 (`validation_batch_size=4`), lưu prediction cùng điểm đáp án/đơn vị. Với 68 câu có 17 batch generation/epoch. Hai rank cùng xử lý một batch 4 câu, không phải 4 câu riêng mỗi GPU.
 3. Chọn epoch tốt nhất trong **5 checkpoint** theo **content_tolerant accuracy**. Nếu hòa: content_exact cao hơn, validation loss thấp hơn, epoch sớm hơn. Thời gian sinh được ghi riêng; không dùng timeout để xếp hạng chất lượng đáp án. Dung sai mặc định `rtol=0.01, atol=0`.
-4. **Train lại từ backbone gốc + LoRA mới**, trên toàn bộ **676 mẫu hợp lệ (608 train + 68 validation nội bộ)**, giữ seed 42 và dùng **số epoch của checkpoint thắng**. Ví dụ epoch 3 tốt nhất thì train lại đúng 3 epoch trên dữ liệu đầy đủ. Không nạp trọng số checkpoint search; learning rate/rank/batch và các hyperparameter khác giữ theo cấu hình search. Optimizer/scheduler được tạo mới cho kích thước dữ liệu đầy đủ.
+4. Search dừng ở trạng thái `search_complete`, lưu `selection.json` và không tự retrain. Sau khi so sánh các cấu hình trên cùng split, chọn thư mục experiment thắng rồi gọi `python -m baseline.experiment --retrain-from <thư_mục_đã_chọn>`. Lệnh này dùng cấu hình đã lưu của search, kiểm tra hash dữ liệu và selection, không dùng cấu hình hiện tại trong `baseline.json`. **Train lại từ backbone gốc + LoRA mới**, trên toàn bộ **676 mẫu hợp lệ (608 train + 68 validation nội bộ)**, giữ seed 42 và dùng **số epoch của checkpoint thắng**. Ví dụ epoch 3 tốt nhất thì train lại đúng 3 epoch trên dữ liệu đầy đủ. Không nạp trọng số checkpoint search; learning rate/rank/batch và các hyperparameter khác giữ theo cấu hình search. Optimizer/scheduler được tạo mới cho kích thước dữ liệu đầy đủ.
 5. Đánh giá adapter cuối trên **dev 339 mẫu** bằng lệnh evaluate riêng. Dev không được đọc trong search/retrain và không dùng chọn checkpoint. Điểm validation đã dùng để chọn model và dữ liệu này đã được học khi train cuối, nên không phải điểm đánh giá độc lập của adapter cuối.
 
-Run tìm epoch và run train cuối chạy **tuần tự** để giải phóng VRAM trước khi khởi tạo lại backbone. Trong mỗi run, launcher tự chạy `torchrun` với **2 worker FSDP song song**, một worker trên mỗi GPU; không cần tự thêm lệnh torchrun vào notebook. Validation generation sau mỗi epoch làm tăng thời gian chạy. `--output-dir` của `baseline.experiment` là thư mục gốc; kết quả train cuối nằm trong thư mục con `final/`. Mỗi lần thử cần một thư mục gốc mới. `baseline.train` CLI mặc định cũng chạy toàn bộ experiment để notebook cũ không bỏ qua validation. Khi JSON có `training_stage="single"`, `"search"` hoặc `"final"`, nó chỉ chạy stage đó; experiment dùng search/final và không gọi lại chính nó. `baseline.evaluate --run-dir <thư_mục_experiment>` tự tìm `final/`, chỉ khi experiment đã hoàn tất.
+Run tìm epoch và run train cuối chạy **tuần tự** để giải phóng VRAM trước khi khởi tạo lại backbone. Trong mỗi run, launcher tự chạy `torchrun` với **2 worker FSDP song song**, một worker trên mỗi GPU; không cần tự thêm lệnh torchrun vào notebook. Validation generation sau mỗi epoch làm tăng thời gian chạy. `--output-dir` của `baseline.experiment` là thư mục gốc; kết quả train cuối nằm trong thư mục con `final/`. Mỗi lần thử cần một thư mục gốc mới. `baseline.train` CLI mặc định cũng chỉ chạy search và chọn best epoch. Retrain phải được gọi riêng; notebook mới có cell chọn `SELECTED_RUN_DIR`, mặc định `None` để Run All không tự retrain. Khi JSON có `training_stage="single"`, `"search"` hoặc `"final"`, nó chỉ chạy stage đó; experiment dùng search/final và không gọi lại chính nó. `baseline.evaluate --run-dir <thư_mục_experiment>` tự tìm `final/`, chỉ khi experiment đã hoàn tất.
 
 ## Chạy song song và tái lập
 
@@ -61,8 +67,8 @@ Run tìm epoch và run train cuối chạy **tuần tự** để giải phóng V
 - Checkpoint lấy LoRA đã đồng bộ về CPU từ rank 0 rồi ghi adapter/JSON. Không gather cả backbone 7B để lưu. Adapter cuối vẫn nạp bằng PEFT thông thường.
 - Decoder dùng activation checkpoint của PyTorch **bên trong module FSDP**, thay cho checkpoint của Transformers bọc cả lời gọi có hook FSDP. **Tắt backward prefetch**, decoder chỉ all-gather khi backward cần chính lớp đó. FSDP2 coi danh sách prefetch rỗng là dùng lịch mặc định, nên code dùng embedding frozen (`set_unshard_in_backward(False)`) làm target no-op cho root/decoder. Cách này tránh all-gather từ hook prefetch và giảm overlap giao tiếp/tính toán; cần đo lại tốc độ trên T4. Embedding shard riêng, root chỉ giữ norm nhỏ. [API prefetch/unshard của PyTorch](https://docs.pytorch.org/docs/2.8/distributed.fsdp.fully_shard.html).
 - Validation cần mọi rank tham gia cùng câu hỏi vì FSDP có collective. Generation dùng `synced_gpus=True` để tránh kẹt khi EOS/deadline khác nhau; rank 0 ghi prediction và quyết định điểm. Validation không chia câu hỏi riêng cho từng GPU. Đánh giá dev sau cùng dùng model chia lớp trong một tiến trình như trước.
-- Seed/split/revision được cố định; effective batch hiện tại là 32. `deterministic_algorithms(..., warn_only=True)` vẫn chỉ cảnh báo kernel không xác định. Không bảo đảm giống từng bit hoặc khớp kết quả của cách chạy chia lớp trước đây. FSDP có chi phí truyền trọng số, cần đo tốc độ thực tế trên T4; không mặc nhiên nhanh gấp đôi.
-- Tiến độ mặc định cập nhật trên một dòng: `Epoch 1/5 | Batch 11/76 | Còn epoch ~00:07:35`. ETA dựa trên thời gian trung bình của các batch đã chạy trong epoch; không cộng validation/checkpoint hoặc retrain chưa biết số epoch. Validation loss và generation có tiến độ/ETA riêng; generation hiện mỗi batch là một câu. Chỉ rank 0 in FSDP. Batch 4/GPU × 2 GPU xử lý tối đa 8 mẫu/lượt: search 608 mẫu có **76 batch/epoch**, retrain 676 mẫu có **85 batch/epoch**.
+- Seed/split/revision được cố định; effective batch hiện tại là 16. `deterministic_algorithms(..., warn_only=True)` vẫn chỉ cảnh báo kernel không xác định. Không bảo đảm giống từng bit hoặc khớp kết quả của cách chạy chia lớp trước đây. FSDP có chi phí truyền trọng số, cần đo tốc độ thực tế trên T4; không mặc nhiên nhanh gấp đôi.
+- Tiến độ mặc định cập nhật trên một dòng: `Epoch 1/5 | Batch 11/76 | Còn epoch ~00:07:35`. ETA dựa trên thời gian trung bình của các batch đã chạy trong epoch; không cộng validation/checkpoint hoặc retrain chưa biết số epoch. Validation loss và generation có tiến độ/ETA riêng; generation dùng batch 4 câu, tối đa 300 token mới/câu. Left padding và attention mask được tạo riêng; output được cắt tại EOS đầu tiên để không tính padding sau khi câu đã kết thúc. `seconds` của mỗi câu validation là thời gian chung của batch, không chia cho 4. Dev vẫn sinh một câu/lượt để đo thời gian từng truy vấn. Chỉ rank 0 in FSDP. Batch 4/GPU × 2 GPU xử lý tối đa 8 mẫu/lượt: search 608 mẫu có **76 batch/epoch**, retrain 676 mẫu có **85 batch/epoch**.
 - Trước khi nạp 7B, mỗi run tự kiểm tra backend thực tế bằng Qwen nhỏ: batch 4 với độ dài khác nhau, 3 optimizer steps × tích lũy 4 batch (12 micro-batches), no-grad forward giữa các bước, đồng bộ gradient và optimizer/clipping đối chiếu model không shard. Kaggle phải hiện `Preflight PASS` trên backend NCCL. Kết quả lưu trong `run.json/config/distributed_preflight`. Đây là kiểm tra đường chạy CUDA/NCCL, không thay thế kiểm tra tải/VRAM của model 7B.
 - `verbose_logging=false` ẩn bảng hyperparameter, thống kê VRAM/scheduler/loss và summary từng epoch. Đổi thành `true` nếu cần in lại cấu hình chi tiết. Cấu hình, loss, số bước cập nhật và kết quả validation vẫn lưu trong `run.json`, `train_log.json` và `validation/epoch-*/metrics.json`. Cảnh báo overflow/lỗi vẫn được hiển thị.
 
@@ -84,7 +90,7 @@ split.json                       # Hash train CSV và ID của train/validation 
 experiment.json                  # Trạng thái tìm best epoch và bước train cuối
 selection.json                   # Điểm mọi checkpoint và checkpoint thắng
 configs/search.json              # Seed 42, 5 epoch trên train nội bộ
-configs/final.json               # Số epoch thắng, train mới từ backbone gốc
+configs/final.json               # Chỉ tạo khi gọi --retrain-from
 search/                          # Run tìm epoch: run.json, train_log.json, adapter/
   epoch-1/, ..., epoch-5/        # Checkpoint LoRA từng epoch
   validation/epoch-1/, ...        # predictions.jsonl và metrics.json từng epoch
@@ -101,10 +107,10 @@ final/evaluation/predictions.jsonl
 | `baseline/data.py` | Tìm CSV, tạo prompt và mask labels |
 | `baseline/model.py` | Chia backbone FP16, LoRA và chunked loss |
 | `baseline/train.py` | Huấn luyện và lưu adapter |
-| `baseline/experiment.py` | Chạy 5 epoch, chọn best epoch, train mới trên train + validation |
+| `baseline/experiment.py` | Search 5 epoch; retrain riêng cấu hình được chọn bằng --retrain-from |
 | `baseline/parallel.py` | Launcher torchrun, FSDP2, chia batch, overflow/clipping và lưu adapter |
 | `baseline/parallel_check.py` | Preflight backend thật: Qwen nhỏ, gradient và optimizer đối chiếu reference |
-| `baseline/validation.py` | Chấm validation sau mỗi epoch và xếp hạng checkpoint |
+| `baseline/validation.py` | Chấm validation, sinh batch 4, xếp hạng checkpoint |
 | `baseline/evaluate.py` | Greedy trên dev, ghi predictions và metrics |
 | `baseline/metrics.py` | Parse JSON và P1 tạm thời |
 | `baseline/check.py` | Kiểm tra dữ liệu/template/độ dài trước train |

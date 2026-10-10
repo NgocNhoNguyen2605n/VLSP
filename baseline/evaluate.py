@@ -39,27 +39,46 @@ def synchronize(gpu_count):
 
 def generate_once(model, tokenizer, question, cfg):
     """Greedy một lần; không retry JSON hỏng, không dùng answer/cot của dev."""
+    return generate_batch(model, tokenizer, [question], cfg)[0]
+
+
+def generate_batch(model, tokenizer, questions, cfg):
+    """Greedy với left padding; mỗi câu một output, thời gian chung của batch."""
+    if not questions:
+        raise ValueError("Batch generation không được rỗng.")
     synchronize(cfg["gpu_count"])
     start = time.perf_counter()
-    ids = prompt_ids(tokenizer, question)
-    if len(ids) + cfg["max_new_tokens"] > model.config.max_position_embeddings:
+    prompts = [prompt_ids(tokenizer, question) for question in questions]
+    width = max(map(len, prompts))
+    if width + cfg["max_new_tokens"] > model.config.max_position_embeddings:
         raise ValueError("Prompt và max_new_tokens vượt context của model.")
-    tensor = torch.tensor([ids], device=model.get_input_embeddings().weight.device)
+    device = model.get_input_embeddings().weight.device
+    tensor = torch.full((len(prompts), width), tokenizer.pad_token_id, dtype=torch.long, device=device)
+    mask = torch.zeros_like(tensor)
+    for index, ids in enumerate(prompts):
+        tensor[index, -len(ids):] = torch.tensor(ids, dtype=torch.long, device=device)
+        mask[index, -len(ids):] = 1
     generation = GenerationConfig(
         do_sample=False, num_beams=1, max_new_tokens=cfg["max_new_tokens"],
         eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
         use_cache=True, temperature=None, top_p=None, top_k=None)
     with torch.inference_mode(), torch.autocast(tensor.device.type, dtype=torch.float16):
         output = model.generate(
-            input_ids=tensor, attention_mask=torch.ones_like(tensor),
+            input_ids=tensor, attention_mask=mask,
             generation_config=generation,
             synced_gpus=torch.distributed.is_initialized(),
             stopping_criteria=StoppingCriteriaList([Deadline(start + cfg["timeout_seconds"])]))
     synchronize(cfg["gpu_count"])
     elapsed = time.perf_counter() - start
-    tokens = output[0, len(ids):].tolist()
-    text = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    return text, elapsed, len(tokens), bool(tokens and tokens[-1] == tokenizer.eos_token_id)
+    results = []
+    for tokens in output[:, width:].tolist():
+        # Câu kết thúc sớm được pad trong khi các câu còn lại tiếp tục sinh.
+        finished = tokenizer.eos_token_id in tokens
+        if finished:
+            tokens = tokens[:tokens.index(tokenizer.eos_token_id) + 1]
+        text = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        results.append((text, elapsed, len(tokens), finished))
+    return results
 
 
 def evaluate(run_dir, result_dir=None, data_root=None):
@@ -68,7 +87,8 @@ def evaluate(run_dir, result_dir=None, data_root=None):
     if not (run_dir / "run.json").is_file() and (run_dir / "experiment.json").is_file():
         experiment = json.loads((run_dir / "experiment.json").read_text(encoding="utf-8"))
         if experiment.get("status") != "complete":
-            raise RuntimeError("Experiment chưa hoàn tất; không chấm adapter trước khi retrain xong.")
+            raise RuntimeError("Experiment chưa hoàn tất; hãy retrain cấu hình đã chọn bằng "
+                               f"python -m baseline.experiment --retrain-from {run_dir} trước khi chấm dev.")
         run_dir = run_dir / "final"
         print(f"Evaluate adapter retrain cuối: {run_dir}", flush=True)
     if not (run_dir / "run.json").is_file():

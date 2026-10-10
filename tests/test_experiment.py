@@ -62,6 +62,20 @@ class SplitTests(unittest.TestCase):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_retrain_cli_uses_only_saved_experiment(self):
+        from baseline.experiment import main
+        with patch('sys.argv', ['baseline.experiment', '--retrain-from', '/chosen/run']), \
+             patch('baseline.experiment.run_retraining') as retrain, \
+             patch('baseline.experiment.read_config') as config:
+            main()
+            retrain.assert_called_once_with('/chosen/run')
+            config.assert_not_called()
+        with patch('sys.argv', ['baseline.experiment', '--retrain-from', '/chosen/run', '--config', 'other.json']), \
+             patch('baseline.experiment.run_retraining') as retrain, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main()
+            retrain.assert_not_called()
+
     def test_legacy_train_cli_runs_experiment_and_internal_stages_do_not_recurse(self):
         from baseline.train import main
         cfg = json.loads(Path('configs/baseline.json').read_text())
@@ -149,7 +163,7 @@ class ExperimentTests(unittest.TestCase):
     def test_five_epochs_and_fresh_final_training(self):
         import torch
         from transformers import Qwen2Config, Qwen2ForCausalLM
-        from baseline.experiment import run_experiment
+        from baseline.experiment import run_experiment, run_retraining
         from baseline.model import backbone_plan, load_model
         from baseline.runtime import arguments, read_config
         from baseline.train import train
@@ -195,11 +209,12 @@ class ExperimentTests(unittest.TestCase):
                 initialized.append((config["training_stage"], config["seed"]))
                 return model, plan
 
-            def generation(model, tokenizer, question, config):
-                calls.append(question)
-                epoch = (len(calls) - 1) // 3 + 1
+            def generation(model, tokenizer, questions, config):
+                epoch = len(calls) // 3 + 1
+                calls.extend(questions)
                 answer = "1" if epoch == 3 else "99"
-                return json.dumps({"answer": answer, "unit": "V", "explanation": "Giải"}), 0.1, 10, True
+                return [(json.dumps({"answer": answer, "unit": "V", "explanation": "Giải"}), 0.1, 10, True)
+                        for question in questions]
 
             def runner(path):
                 train(read_config(arguments("test").parse_args(["--config", str(path)])))
@@ -208,10 +223,32 @@ class ExperimentTests(unittest.TestCase):
                   patch("baseline.model.backbone_plan", cpu_plan),
                   patch("baseline.train.load_model", cpu_model),
                   patch("baseline.train.load_tokenizer", return_value=Tokenizer()),
-                  patch("baseline.validation.generate_once", generation),
+                  patch("baseline.validation.generate_batch", generation),
                   contextlib.redirect_stdout(io.StringIO())):
                 # Trường cấu hình cũ không được kích hoạt thêm 5 run theo seed.
                 result = run_experiment({**cfg, "search_seeds": [42, 43, 44, 45, 46]}, runner=runner)
+                self.assertEqual(result["status"], "search_complete")
+                self.assertEqual(initialized, [("search", 42)])
+                self.assertFalse((root / "experiment/final").exists())
+                self.assertFalse((root / "experiment/configs/final.json").exists())
+                source_config = root / "experiment/experiment.json"
+                saved_config = source_config.read_bytes()
+                tampered = json.loads(saved_config)
+                tampered['config']['learning_rate'] = 0.5
+                source_config.write_text(json.dumps(tampered))
+                with self.assertRaisesRegex(ValueError, "Cấu hình đã lưu"):
+                    run_retraining(root / "experiment", runner=runner)
+                source_config.write_bytes(saved_config)
+                dataset = root / 'train_dataset.csv'
+                saved_data = dataset.read_bytes()
+                dataset.write_bytes(saved_data + b'\n')
+                with self.assertRaisesRegex(ValueError, "Train CSV đã đổi"):
+                    run_retraining(root / "experiment", runner=runner)
+                dataset.write_bytes(saved_data)
+                self.assertEqual(initialized, [("search", 42)])
+                # Thay đổi config hiện tại không được thay đổi cấu hình search đã chọn.
+                cfg["learning_rate"] = 0.5
+                result = run_retraining(root / "experiment", runner=runner)
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["completed_epochs"], [1, 2, 3, 4, 5])
             self.assertEqual(initialized, [("search", 42), ("final", 42)])
@@ -221,6 +258,7 @@ class ExperimentTests(unittest.TestCase):
             final = json.loads((root / "experiment/final/run.json").read_text())
             self.assertEqual(final["training_samples"], 30)
             self.assertEqual(final["config"]["epochs"], 3)
+            self.assertNotEqual(final["config"]["learning_rate"], cfg["learning_rate"])
             self.assertEqual(len(json.loads((root / "experiment/final/train_log.json").read_text())), 3)
             search = json.loads((root / "experiment/search/run.json").read_text())
             self.assertEqual(search["training_samples"], 27)
@@ -232,6 +270,8 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(len(selection["candidates"]), 5)
             with self.assertRaises(FileExistsError):
                 run_experiment(cfg, runner=runner)
+            with self.assertRaisesRegex(RuntimeError, "chưa retrain"):
+                run_retraining(root / "experiment", runner=runner)
 
 
 if __name__ == "__main__":
