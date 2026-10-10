@@ -26,7 +26,7 @@
   "lora_dropout": 0.0,
   "loss_chunk_size": 64,
   "log_every": 10,
-  "max_new_tokens": 1536,
+  "max_new_tokens": 300,
   "timeout_seconds": 60,
   "rtol": 0.01,
   "atol": 0.0,
