@@ -1,0 +1,76 @@
+"""Chấm validation nội bộ sau mỗi epoch; không dùng dev để chọn model."""
+
+import json
+import math
+from pathlib import Path
+
+import torch
+
+from .evaluate import generate_once
+from .metrics import parse_prediction, score_prediction
+from .runtime import save_json
+
+
+def checkpoint_rank(result):
+    """Đúng đáp án/đơn vị, exact, loss, epoch sớm, rồi seed nhỏ hơn."""
+    total = result["total"]
+    loss = result["validation_loss"]
+    if total <= 0 or not math.isfinite(loss):
+        raise ValueError("Checkpoint thiếu validation hợp lệ.")
+    return (result["content_tolerant"] / total, result["content_exact"] / total,
+            -loss, -result["epoch"], -result["seed"])
+
+
+def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir):
+    """Loss có trọng số token; sinh một lần mỗi câu và so đáp án + đơn vị."""
+    learner.eval()
+    model = learner.model
+    device = model.get_input_embeddings().weight.device
+    total_loss, total_tokens = 0.0, 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            with torch.autocast(device.type, dtype=torch.float16):
+                loss = learner(**batch)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Validation loss không hữu hạn ở epoch {epoch}.")
+            tokens = int(batch["labels"][:, 1:].ne(-100).sum())
+            total_loss += loss.item() * tokens
+            total_tokens += tokens
+    if not total_tokens:
+        raise ValueError("Validation không có token assistant.")
+    result_dir = Path(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result = {"seed": cfg["seed"], "epoch": epoch, "total": len(rows),
+              "validation_loss": total_loss / total_tokens,
+              "content_tolerant": 0, "content_exact": 0, "valid_json": 0,
+              "over_time": 0, "p1_estimate": 0}
+    previous_cache = model.config.use_cache
+    model.config.use_cache = True
+    try:
+        with (result_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
+            for index, row in enumerate(rows, start=1):
+                raw, elapsed, token_count, finished = generate_once(model, tokenizer, row["question"], cfg)
+                prediction = parse_prediction(raw)
+                score = score_prediction(prediction, row, cfg["rtol"], cfg["atol"])
+                over_time = elapsed > cfg["timeout_seconds"]
+                result["content_tolerant"] += score["tolerant"]
+                result["content_exact"] += score["exact"]
+                result["valid_json"] += prediction is not None
+                result["over_time"] += over_time
+                result["p1_estimate"] += score["tolerant"] and not over_time
+                handle.write(json.dumps({"query_id": row["id"], "prediction": prediction,
+                                         "raw_output": raw, "gold_answer": row["answer"],
+                                         "gold_unit": row["unit"], "score": score,
+                                         "seconds": elapsed, "generated_tokens": token_count,
+                                         "finished": finished, "over_time": over_time}, ensure_ascii=False) + "\n")
+                handle.flush()
+                if index == 1 or index % 10 == 0 or index == len(rows):
+                    print(f"Validation seed={cfg['seed']} epoch={epoch}: {index}/{len(rows)} | "
+                          f"đúng={result['content_tolerant']}", flush=True)
+    finally:
+        model.config.use_cache = previous_cache
+    result["accuracy"] = result["content_tolerant"] / result["total"]
+    result["selection_metric"] = "content_tolerant accuracy; không áp dụng timeout khi xếp hạng"
+    save_json(result_dir / "metrics.json", result)
+    return result

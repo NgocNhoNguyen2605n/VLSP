@@ -78,7 +78,7 @@ def evaluate(run_dir, result_dir=None, data_root=None):
         raise FileExistsError(f"{result_dir} đã có kết quả; truyền --result-dir khác để chạy lại.")
     splits, info = load_data(cfg)
     for split in ("train", "dev"):
-        if info[split]["sha256"] != manifest["data"][split]["sha256"]:
+        if split in manifest["data"] and info[split]["sha256"] != manifest["data"][split]["sha256"]:
             raise ValueError(f"{split} đã đổi từ lúc train; không so sánh các lần chạy khác dữ liệu.")
     tokenizer = load_tokenizer(cfg)
     if hashlib.sha256(tokenizer.chat_template.encode()).hexdigest() != manifest["template_sha256"]:
@@ -90,7 +90,7 @@ def evaluate(run_dir, result_dir=None, data_root=None):
               "content_tolerant": 0, "p1_estimate": 0, "over_time": 0,
               "unfinished_generation": 0, "unsupported_symbolic": 0,
               "overlap_samples": 0, "overlap_correct": 0, "unseen_correct": 0}
-    print(f"Evaluate {counts['total']} mẫu | greedy | seed=42 | "
+    print(f"Evaluate {counts['total']} mẫu | greedy | seed={cfg['seed']} | "
           f"rtol={cfg['rtol']}, atol={cfg['atol']} (tạm thời).", flush=True)
     with (result_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
         for index, row in enumerate(splits["dev"], start=1):
@@ -123,7 +123,7 @@ def evaluate(run_dir, result_dir=None, data_root=None):
                 print(f"Dev {index}/{counts['total']} | đúng ước lượng={counts['p1_estimate']}", flush=True)
     summary = {**counts, "accuracy_estimate": counts["p1_estimate"] / counts["total"],
                "rtol": cfg["rtol"], "atol": cfg["atol"], "timeout_seconds": cfg["timeout_seconds"],
-               "official_metric": False, "environment": environment(),
+               "official_metric": False, "environment": environment(), "data": info,
                "notes": ["BTC chưa công bố dung sai và evaluator chính thức.",
                          "Exact: chuỗi đáp án sau NFC/khoảng trắng + đơn vị alias ASCII.",
                          "Tolerant: biểu thức số an toàn; không đổi thang đơn vị, không suy luận tương đương biểu thức có biến.",

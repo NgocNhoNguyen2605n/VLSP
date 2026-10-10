@@ -1,4 +1,4 @@
-"""Fine-tune LoRA FP16 trên hai T4, một tiến trình, seed 42."""
+"""Fine-tune LoRA FP16; một run tìm checkpoint hoặc train cuối từ backbone gốc."""
 
 from .runtime import arguments, environment, read_config, save_json, setup_seed  # Cấu hình và seed.
 
@@ -12,8 +12,9 @@ import torch  # Huấn luyện, autocast FP16 và kiểm tra gradient.
 from torch.utils.data import DataLoader  # Shuffle có seed, không dùng worker ngẫu nhiên.
 from transformers import get_cosine_schedule_with_warmup  # Learning rate giảm theo lịch cố định.
 
-from .data import collate_batch, encode_sample, load_data  # Loader và assistant-only labels.
+from .data import apply_training_split, collate_batch, encode_sample, load_data
 from .model import ChunkedLoss, diagnose_nonfinite, load_model, load_tokenizer  # Backbone và chẩn đoán.
+from .validation import checkpoint_rank, validate_epoch
 
 
 def optimizer_step(params, optimizer, scaler, scheduler, max_norm):
@@ -34,26 +35,38 @@ def optimizer_step(params, optimizer, scaler, scheduler, max_norm):
 
 
 def train(cfg):
-    """Train số epoch cố định; không chọn model theo điểm dev để tránh chọn may mắn."""
+    """Search chỉ dùng train nội bộ; final tạo adapter mới trên toàn bộ train."""
     setup_seed(cfg["seed"])
     output = Path(cfg["output_dir"])
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"{output} đã có dữ liệu; dùng --output-dir khác để giữ kết quả cũ.")
-    splits, data_info = load_data(cfg)
+    stage = cfg.get("training_stage", "single")
+    if stage not in ("single", "search", "final"):
+        raise ValueError("training_stage phải là single, search hoặc final.")
+    splits, data_info = load_data(cfg, splits=("train",) if stage != "single" else ("train", "dev"))
+    training_rows, validation_rows, split_info = splits["train"], [], None
+    if stage == "search":
+        training_rows, validation_rows, split_info = apply_training_split(
+            splits["train"], data_info["train"], cfg["split_file"])
     tokenizer = load_tokenizer(cfg)
-    features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in splits["train"]]
-    # Kiểm tra độ dài cả dev trước khi tải backbone; không dùng nhãn dev để train.
-    dev_max = max(len(encode_sample(tokenizer, row, cfg["max_length"])["input_ids"])
-                  for row in splits["dev"])
+    features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in training_rows]
+    validation_features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in validation_rows]
+    # Run single vẫn kiểm tra dev; search/final không đọc dev.
+    if "dev" in splits:
+        for row in splits["dev"]:
+            encode_sample(tokenizer, row, cfg["max_length"])
     loader = DataLoader(features, batch_size=cfg["batch_size"], shuffle=True,
                         generator=torch.Generator().manual_seed(cfg["seed"]), num_workers=0,
                         collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id))
-    print(f"Dữ liệu: train={len(features)}, dev={len(splits['dev'])}; "
-          f"bỏ mẫu thiếu answer={data_info['train']['skipped_ids']}; max dev={dev_max} token.", flush=True)
+    validation_loader = DataLoader(validation_features, batch_size=cfg["batch_size"], shuffle=False,
+                                  num_workers=0, collate_fn=partial(
+                                      collate_batch, pad_token_id=tokenizer.pad_token_id))
+    print(f"Dữ liệu: stage={stage}, train={len(features)}, validation={len(validation_rows)}; "
+          f"bỏ mẫu thiếu answer={data_info['train']['skipped_ids']}; seed={cfg['seed']}.", flush=True)
     print(f"Đang nạp {cfg['model_id']} FP16 và gắn LoRA...", flush=True)
     model, plan = load_model(cfg, training=True)
     print(f"LoRA FP16: backbone={plan['base_parameters']:,}; "
-          f"tham số học={plan['trainable_parameters']:,}; GPU={cfg['gpu_count']}; seed=42.", flush=True)
+          f"tham số học={plan['trainable_parameters']:,}; GPU={cfg['gpu_count']}; seed={cfg['seed']}.", flush=True)
     if not plan["within_8b_backbone"]:
         print("Thử nghiệm nội bộ: backbone vượt giới hạn 8B của cuộc thi.", flush=True)
     params = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -65,15 +78,18 @@ def train(cfg):
         optimizer, num_warmup_steps=math.ceil(total_steps * cfg["warmup_ratio"]),
         num_training_steps=total_steps)
     # Scale mặc định 65536 có thể gây nhiều overflow lúc đầu trên backbone FP16.
-    scaler = torch.amp.GradScaler("cuda", init_scale=cfg.get("fp16_init_scale", 128.0))
-    learner = ChunkedLoss(model, cfg["loss_chunk_size"])
     input_device = model.get_input_embeddings().weight.device
+    scaler = torch.amp.GradScaler(input_device.type, init_scale=cfg.get("fp16_init_scale", 128.0))
+    learner = ChunkedLoss(model, cfg["loss_chunk_size"])
     manifest = {"config": cfg, "data": data_info, "environment": environment(), "model": plan,
                 "template_sha256": hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
                 "effective_batch_size": cfg["batch_size"] * accumulation,
-                "selection": "final epoch; dev không dùng để chọn checkpoint",
+                "training_stage": stage, "training_samples": len(training_rows), "split": split_info,
+                "initialization": "backbone gốc và adapter LoRA mới; không nạp checkpoint search",
+                "selection": "validation answer+unit accuracy" if stage == "search" else "final epoch",
                 "training_status": "running"}
     save_json(output / "run.json", manifest)
+    best = None
     updates, skipped_updates, history = 0, 0, []
     consecutive_skips, successful_updates = 0, 0
     max_skips = cfg.get("max_consecutive_skips", 8)
@@ -89,7 +105,7 @@ def train(cfg):
             # Nhóm cuối ít mẫu hơn vẫn được chia đúng số micro-batch thực tế.
             group_start = index // accumulation * accumulation
             group_size = min(accumulation, len(loader) - group_start)
-            with torch.autocast("cuda", dtype=torch.float16):
+            with torch.autocast(input_device.type, dtype=torch.float16):
                 loss = learner(**batch)
             if not torch.isfinite(loss):
                 detail = diagnose_nonfinite(learner, batch)
@@ -133,13 +149,29 @@ def train(cfg):
         if successful_updates == 0:
             raise FloatingPointError("Chưa có bước cập nhật trọng số thành công; không lưu adapter để chấm.")
         # Mỗi epoch lưu adapter nhỏ; không sao chép trọng số backbone.
-        model.save_pretrained(output / f"epoch-{epoch}")
+        checkpoint = output / f"epoch-{epoch}"
+        model.save_pretrained(checkpoint)
+        if validation_rows:
+            try:
+                result = validate_epoch(learner, validation_loader, validation_rows, tokenizer, cfg,
+                                        epoch, output / "validation" / f"epoch-{epoch}")
+            except Exception as error:
+                manifest.update(training_status="failed", failure=str(error))
+                save_json(output / "run.json", manifest)
+                raise
+            result["checkpoint"] = str(checkpoint.resolve())
+            history[-1]["validation"] = result
+            if best is None or checkpoint_rank(result) > checkpoint_rank(best):
+                best = result.copy()
+                save_json(output / "best_checkpoint.json", best)
+            print(f"Epoch {epoch}: validation đúng={result['content_tolerant']}/{result['total']} | "
+                  f"loss={result['validation_loss']:.4f} | best epoch={best['epoch']}", flush=True)
         save_json(output / "train_log.json", history)
         print(f"Epoch {epoch}/{cfg['epochs']} hoàn tất | loss={history[-1]['loss']:.4f}", flush=True)
     model.save_pretrained(output / "adapter")
     tokenizer.save_pretrained(output / "adapter")
     manifest.update(training_status="complete", successful_optimizer_steps=successful_updates,
-                    skipped_optimizer_steps=skipped_updates)
+                    skipped_optimizer_steps=skipped_updates, best_checkpoint=best)
     save_json(output / "run.json", manifest)
     print(f"Đã lưu adapter: {output / 'adapter'}", flush=True)
 

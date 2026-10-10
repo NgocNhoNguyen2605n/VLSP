@@ -29,8 +29,8 @@ def read_config(args):
     for name in ("data_root", "train_file", "dev_file", "output_dir"):
         if getattr(args, name, None) is not None:
             cfg[name] = getattr(args, name)
-    if cfg["seed"] != 42:
-        raise ValueError("Baseline này cố định seed = 42.")
+    if type(cfg["seed"]) is not int or not 0 <= cfg["seed"] < 2**32:
+        raise ValueError("seed phải là số nguyên trong [0, 2**32).")
     if not cfg.get("revision") or cfg["revision"] == "main":
         raise ValueError("Cần revision cố định để tránh model thay đổi giữa các lần chạy.")
     for name in ("max_length", "epochs", "batch_size", "gradient_accumulation_steps",

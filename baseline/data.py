@@ -2,9 +2,12 @@
 
 import csv  # Đọc CSV có dấu phẩy, BOM và xuống dòng trong ô.
 import json  # Đóng gói câu trả lời theo schema shared task.
+import math
+import random
 from pathlib import Path  # Tìm file trong các thư mục Input lồng nhau.
 
 from .runtime import fingerprint  # Hash dữ liệu gốc, không chỉnh sửa CSV.
+from .metrics import canonical_text
 
 COLUMNS = ("id", "question", "cot", "answer", "unit")
 SYSTEM = (
@@ -61,15 +64,61 @@ def load_csv(path, split, skip_missing_answer=False):
     return rows, skipped
 
 
-def load_data(cfg):
+def load_data(cfg, splits=("train", "dev")):
     """Nạp hai split riêng; không gộp dev vào dữ liệu huấn luyện."""
-    splits, info = {}, {}
-    for split in ("train", "dev"):
+    rows_by_split, info = {}, {}
+    for split in splits:
         path = find_csv(cfg["data_root"], split, cfg.get(f"{split}_file"))
-        splits[split], skipped = load_csv(path, split, cfg["skip_missing_answer"])
+        rows_by_split[split], skipped = load_csv(path, split, cfg["skip_missing_answer"])
         info[split] = {"path": str(path), "sha256": fingerprint(path),
-                       "samples": len(splits[split]), "skipped_ids": skipped}
-    return splits, info
+                       "samples": len(rows_by_split[split]), "skipped_ids": skipped}
+    return rows_by_split, info
+
+
+def split_training_rows(rows, fraction=0.1, seed=42):
+    """Chia cố định theo nhóm câu hỏi; giữ câu trùng ở cùng phía."""
+    if not 0 < fraction < 1:
+        raise ValueError("validation_fraction phải nằm giữa 0 và 1.")
+    groups = {}
+    for row in rows:
+        groups.setdefault(canonical_text(row["question"]), []).append(row)
+    if len(groups) < 2:
+        raise ValueError("Cần ít nhất hai nhóm câu hỏi khác nhau để chia train/validation.")
+    groups = list(groups.values())
+    random.Random(seed).shuffle(groups)
+    target = min(len(rows) - 1, math.ceil(len(rows) * fraction))
+    # Subset-sum chọn số mẫu gần mục tiêu nhất mà không tách câu trùng.
+    reachable = {0: ()}
+    for index, group in enumerate(groups):
+        for size, selected in list(reachable.items()):
+            new_size = size + len(group)
+            if new_size < len(rows) and new_size not in reachable:
+                reachable[new_size] = selected + (index,)
+        if target in reachable:
+            break
+    size = min((n for n in reachable if n > 0), key=lambda n: (abs(n - target), n))
+    val_ids = {row["id"] for i in reachable[size] for row in groups[i]}
+    return ([row for row in rows if row["id"] not in val_ids],
+            [row for row in rows if row["id"] in val_ids])
+
+
+def apply_training_split(rows, info, path):
+    """Kiểm tra manifest split và trả hai tập, không đọc hay dùng dev."""
+    split = json.loads(Path(path).read_text(encoding="utf-8"))
+    if split["train_csv_sha256"] != info["sha256"]:
+        raise ValueError("CSV train đã đổi từ lúc tạo split.")
+    train_ids, val_ids = split["train_ids"], split["validation_ids"]
+    if (not train_ids or not val_ids or len(set(train_ids)) != len(train_ids)
+            or len(set(val_ids)) != len(val_ids) or set(train_ids) & set(val_ids)
+            or set(train_ids) | set(val_ids) != {row["id"] for row in rows}):
+        raise ValueError("Split không phải hai tập ID rời nhau bao phủ toàn bộ train hợp lệ.")
+    train_ids, val_ids = set(train_ids), set(val_ids)
+    training = [row for row in rows if row["id"] in train_ids]
+    validation = [row for row in rows if row["id"] in val_ids]
+    if ({canonical_text(row["question"]) for row in training}
+            & {canonical_text(row["question"]) for row in validation}):
+        raise ValueError("Câu hỏi trùng xuất hiện ở cả train và validation.")
+    return training, validation, split
 
 
 def prompt_messages(question):
