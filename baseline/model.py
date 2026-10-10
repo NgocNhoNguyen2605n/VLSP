@@ -5,8 +5,18 @@ import torch.nn.functional as F  # Cross-entropy cho dự đoán token tiếp th
 from peft import LoraConfig, PeftModel, get_peft_model  # Tạo/lưu/nạp adapter LoRA.
 from torch.utils.checkpoint import checkpoint  # Tính lại logits khi backward để giảm VRAM.
 from transformers import AutoConfig, AutoTokenizer, Qwen2ForCausalLM  # Model và template chính thức.
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def configure_attention():
+    """SDPA math giữ trung gian FP32, tránh QK^T tràn trước softmax trên T4."""
+    torch.backends.cuda.enable_math_sdp(True)
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
 
 def load_tokenizer(cfg):
@@ -68,9 +78,10 @@ def load_model(cfg, training=False, adapter=None):
     """Nạp Qwen2.5-Math FP16 và adapter LoRA cho task văn bản."""
     text, mapping, plan = backbone_plan(cfg)
     require_gpus(cfg, plan)
+    configure_attention()
     base, info = Qwen2ForCausalLM.from_pretrained(
         cfg["model_id"], revision=cfg["revision"], config=text, dtype=torch.float16,
-        device_map=mapping, attn_implementation="eager", output_loading_info=True)
+        device_map=mapping, attn_implementation="sdpa", output_loading_info=True)
     if any(info.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise RuntimeError(f"Checkpoint không nạp đầy đủ: {info}")
     if training:
@@ -94,6 +105,7 @@ def load_model(cfg, training=False, adapter=None):
         model.config.use_cache = True
         model.eval()
     plan["trainable_parameters"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    plan["attention"] = "sdpa math; FP32 intermediates"
     return model, plan
 
 
@@ -130,3 +142,28 @@ class ChunkedLoss(torch.nn.Module):
             loss = checkpoint(chunk_loss, state, target, use_reentrant=False) if self.training else chunk_loss(state, target)
             total = total + loss
         return total / targets.numel()
+
+
+def diagnose_nonfinite(learner, batch):
+    """Chạy lại batch lỗi một lần để tìm projection/norm đầu tiên sinh NaN/Inf."""
+    handles = []
+
+    def hook_for(name):
+        def check(module, inputs, output):
+            if isinstance(output, torch.Tensor) and not torch.isfinite(output).all():
+                raise FloatingPointError(f"Output không hữu hạn ở {name} (dtype={output.dtype}).")
+        return check
+
+    try:
+        for name, module in learner.model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding, Qwen2RMSNorm)):
+                handles.append(module.register_forward_hook(hook_for(name)))
+        device_type = batch["input_ids"].device.type
+        with torch.no_grad(), torch.autocast(device_type, dtype=torch.float16):
+            loss = learner(**batch)
+        return f"Các projection/norm hữu hạn; loss={loss.item()} (kiểm tra hidden/logits/loss)."
+    except FloatingPointError as error:
+        return str(error)
+    finally:
+        for handle in handles:
+            handle.remove()

@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader  # Shuffle có seed, không dùng worker
 from transformers import get_cosine_schedule_with_warmup  # Learning rate giảm theo lịch cố định.
 
 from .data import collate_batch, encode_sample, load_data  # Loader và assistant-only labels.
-from .model import ChunkedLoss, load_model, load_tokenizer  # Backbone FP16 và adapter LoRA.
+from .model import ChunkedLoss, diagnose_nonfinite, load_model, load_tokenizer  # Backbone và chẩn đoán.
 
 
 def optimizer_step(params, optimizer, scaler, scheduler, max_norm):
@@ -92,7 +92,11 @@ def train(cfg):
             with torch.autocast("cuda", dtype=torch.float16):
                 loss = learner(**batch)
             if not torch.isfinite(loss):
-                raise FloatingPointError(f"Loss không hữu hạn tại epoch {epoch}, batch {index + 1}.")
+                detail = diagnose_nonfinite(learner, batch)
+                message = f"Loss không hữu hạn tại epoch {epoch}, batch {index + 1}. {detail}"
+                manifest.update(training_status="failed", failure=message)
+                save_json(output / "run.json", manifest)
+                raise FloatingPointError(message)
             tokens = int(batch["labels"][:, 1:].ne(-100).sum())
             epoch_sum += loss.detach().item() * tokens
             epoch_tokens += tokens

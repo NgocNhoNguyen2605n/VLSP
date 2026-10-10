@@ -97,4 +97,5 @@ def environment():
     return {"python": platform.python_version(), "packages": packages,
             "cuda": torch.version.cuda,
             "gpus": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
-            "determinism": "seed42; deterministic algorithms warn_only; eager attention"}
+            "determinism": "seed42; deterministic algorithms warn_only; SDPA math attention",
+            "fp16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction}

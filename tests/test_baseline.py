@@ -154,6 +154,55 @@ class TrainingTests(unittest.TestCase):
                 evaluate(path)
 
 
+class AttentionStabilityTests(unittest.TestCase):
+    """Tái hiện tràn QK^T FP16 và kiểm tra đường attention thay thế."""
+
+    def test_sdpa_math_survives_fp16_attention_overflow(self):
+        import torch
+        from types import SimpleNamespace
+        from baseline.model import configure_attention
+        from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
+        from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+        configure_attention()
+        module = SimpleNamespace(num_key_value_groups=1, training=False, is_causal=False)
+        query = torch.full((1, 1, 2, 8), 300.0, dtype=torch.float16, requires_grad=True)
+        key = torch.full_like(query, 300.0, requires_grad=True)
+        value = torch.ones_like(query, requires_grad=True)
+        with torch.autocast("cpu", dtype=torch.float16):
+            broken, _ = eager_attention_forward(module, query, key, value, None, scaling=8**-0.5)
+            stable, _ = sdpa_attention_forward(module, query, key, value, None, scaling=8**-0.5)
+        self.assertFalse(torch.isfinite(broken).all())
+        torch.testing.assert_close(stable, torch.ones_like(stable))
+        stable.float().sum().backward()
+        self.assertTrue(all(tensor.grad is not None and torch.isfinite(tensor.grad).all()
+                            for tensor in (query, key, value)))
+
+    def test_diagnostic_names_layer_and_removes_hooks(self):
+        import torch
+        from baseline.model import diagnose_nonfinite
+
+        class Learner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+
+            def forward(self, input_ids):
+                return self.model(input_ids.float()).float().sum()
+
+        learner = Learner()
+        batch = {"input_ids": torch.ones((1, 2), dtype=torch.long)}
+        with torch.no_grad():
+            learner.model[0].weight.fill_(float("inf"))
+        detail = diagnose_nonfinite(learner, batch)
+        self.assertIn("Output không hữu hạn ở 0", detail)
+        self.assertFalse(learner.model[0]._forward_hooks)
+        with torch.no_grad():
+            learner.model[0].weight.fill_(1.0)
+        self.assertIn("projection/norm hữu hạn", diagnose_nonfinite(learner, batch))
+        self.assertFalse(learner.model[0]._forward_hooks)
+
+
 class NativeModelTests(unittest.TestCase):
     """Model Qwen2 rất nhỏ để kiểm tra loss, gradient và checkpoint."""
 
@@ -283,6 +332,8 @@ class NativeModelTests(unittest.TestCase):
             with patch("baseline.model.require_gpus"), patch("baseline.model.backbone_plan", cpu_plan):
                 model, plan = load_model(cfg, training=True)
             self.assertGreater(plan["trainable_parameters"], 0)
+            self.assertEqual(model.config._attn_implementation, "sdpa")
+            self.assertEqual(plan["attention"], "sdpa math; FP32 intermediates")
             self.assertFalse(model.config.use_cache)
             for name, parameter in model.named_parameters():
                 if "lora_" in name:
