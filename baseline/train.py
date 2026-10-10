@@ -1,6 +1,6 @@
 """Fine-tune LoRA FP16; một run tìm checkpoint hoặc train cuối từ backbone gốc."""
 
-from .runtime import arguments, environment, read_config, save_json, setup_seed  # Cấu hình và seed.
+from .runtime import arguments, environment, print_training_config, read_config, save_json, setup_seed  # Cấu hình và seed.
 
 import hashlib  # Hash template để đối chiếu train/inference.
 import math  # Tính số optimizer steps và scheduler.
@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader  # Shuffle có seed, không dùng worker
 from transformers import get_cosine_schedule_with_warmup  # Learning rate giảm theo lịch cố định.
 
 from .data import apply_training_split, collate_batch, encode_sample, load_data
-from .model import ChunkedLoss, diagnose_nonfinite, load_model, load_tokenizer  # Backbone và chẩn đoán.
+from .model import TARGETS, ChunkedLoss, diagnose_nonfinite, load_model, load_tokenizer  # Backbone và chẩn đoán.
 from .validation import checkpoint_rank, validate_epoch
 
 
@@ -36,6 +36,7 @@ def optimizer_step(params, optimizer, scaler, scheduler, max_norm):
 
 def train(cfg):
     """Search chỉ dùng train nội bộ; final tạo adapter mới trên toàn bộ train."""
+    print_training_config(cfg, TARGETS)
     setup_seed(cfg["seed"])
     output = Path(cfg["output_dir"])
     if output.exists() and any(output.iterdir()):
@@ -77,6 +78,9 @@ def train(cfg):
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=math.ceil(total_steps * cfg["warmup_ratio"]),
         num_training_steps=total_steps)
+    print(f"Scheduler thực tế: warmup_steps={math.ceil(total_steps * cfg['warmup_ratio'])} | "
+          f"total_steps={total_steps} | AdamW betas={optimizer.defaults['betas']} | "
+          f"eps={optimizer.defaults['eps']:g}", flush=True)
     # Scale mặc định 65536 có thể gây nhiều overflow lúc đầu trên backbone FP16.
     input_device = model.get_input_embeddings().weight.device
     scaler = torch.amp.GradScaler(input_device.type, init_scale=cfg.get("fp16_init_scale", 128.0))

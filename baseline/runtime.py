@@ -51,6 +51,42 @@ def read_config(args):
     return cfg
 
 
+def print_training_config(cfg, target_modules, world_size=1):
+    """In cấu hình của run hiện tại; worker distributed chỉ gọi từ rank 0."""
+    stage = cfg.get("training_stage", "single")
+    batch = cfg["batch_size"]
+    accumulation = cfg["gradient_accumulation_steps"]
+    mode = "FSDP2" if world_size > 1 else "model parallel (một tiến trình)"
+    batch_label = "batch_size/GPU" if world_size > 1 else "batch_size/tiến trình"
+    lines = [
+        f"Cấu hình training | stage={stage} | output={cfg['output_dir']}",
+        f"Backbone: {cfg['model_id']} | revision={cfg['revision']}",
+        f"Chế độ: {mode} | GPU={cfg['gpu_count']} | seed={cfg['seed']}",
+        "Precision: backbone FP16, RMSNorm/LoRA FP32 | LoRA không lượng tử hóa | attention=SDPA math",
+        f"Train: epochs={cfg['epochs']} | {batch_label}={batch} | "
+        f"global batch={batch * world_size} | gradient_accumulation_steps={accumulation} | "
+        f"effective batch={batch * world_size * accumulation} (nhóm đầy đủ)",
+        f"Optimizer: AdamW | learning_rate={cfg['learning_rate']:g} | weight_decay={cfg['weight_decay']:g}",
+        f"Scheduler: cosine | warmup_ratio={cfg['warmup_ratio']:g} | max_grad_norm={cfg['max_grad_norm']:g}",
+        f"LoRA: r={cfg['lora_rank']} | alpha={cfg['lora_alpha']} | dropout={cfg['lora_dropout']:g} | "
+        f"target_modules={','.join(target_modules)}",
+        f"Tokens: max_length={cfg['max_length']} | loss_chunk_size={cfg['loss_chunk_size']} | "
+        f"group_by_length={bool(world_size > 1 and cfg.get('group_by_length', False))}",
+        f"FP16: init_scale={cfg.get('fp16_init_scale', 128.0):g} | "
+        f"max_consecutive_skips={cfg.get('max_consecutive_skips', 8)} | activation_checkpointing=non-reentrant",
+    ]
+    if stage == "search":
+        lines.extend([
+            f"Split: validation_fraction={cfg.get('validation_fraction', 0.1):g} | "
+            f"split_seed={cfg.get('split_seed', 42)} | chọn best epoch theo validation answer+unit accuracy",
+            f"Validation: greedy | max_new_tokens={cfg['max_new_tokens']} | "
+            f"timeout_seconds={cfg['timeout_seconds']} | rtol={cfg['rtol']:g} | atol={cfg['atol']:g}",
+        ])
+    elif stage == "final":
+        lines.append("Retrain: toàn bộ train + validation, backbone gốc + LoRA mới, optimizer/scheduler mới.")
+    print("\n".join(lines), flush=True)
+
+
 def setup_seed(seed=42):
     """Cố định RNG; ưu tiên phép toán xác định, vẫn báo kernel chưa hỗ trợ."""
     import numpy as np  # Seed cho NumPy.

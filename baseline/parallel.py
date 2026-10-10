@@ -1,6 +1,6 @@
 """FSDP2 chia backbone; LoRA replicate, gradient đồng bộ sau backward."""
 
-from .runtime import arguments, environment, read_config, save_json, setup_seed
+from .runtime import arguments, environment, print_training_config, read_config, save_json, setup_seed
 
 import gc
 import hashlib
@@ -26,7 +26,7 @@ from transformers import get_cosine_schedule_with_warmup
 from safetensors.torch import load_file, save_file
 
 from .data import apply_training_split, collate_batch, encode_sample, load_data
-from .model import ChunkedLoss, load_model, load_tokenizer
+from .model import TARGETS, ChunkedLoss, load_model, load_tokenizer
 from .validation import checkpoint_rank, validate_epoch
 
 
@@ -300,6 +300,15 @@ def train_parallel(cfg, device):
     total_steps = math.ceil(micro_steps / accumulation) * cfg["epochs"]
     scheduler = get_cosine_schedule_with_warmup(optimizer,
         num_warmup_steps=math.ceil(total_steps * cfg["warmup_ratio"]), num_training_steps=total_steps)
+    if primary:
+        print(f"Model đã nạp: backbone={plan['base_parameters']:,} tham số | "
+              f"LoRA trainable={plan['trainable_parameters']:,} | "
+              f"backbone FP16/GPU={plan['fp16_weight_gib_per_gpu'][rank]:.2f} GiB | "
+              f"LoRA + gradient + AdamW/GPU={plan['lora_training_state_gib_per_gpu']:.2f} GiB "
+              "(chưa gồm activation/buffer)", flush=True)
+        print(f"Scheduler thực tế: warmup_steps={math.ceil(total_steps * cfg['warmup_ratio'])} | "
+              f"total_steps={total_steps} | AdamW betas={optimizer.defaults['betas']} | "
+              f"eps={optimizer.defaults['eps']:g}", flush=True)
     scaler = ParallelScaler(cfg.get("fp16_init_scale", 128.0), replicated=True)
     learner = ChunkedLoss(model, cfg["loss_chunk_size"])
     manifest = {"config": cfg, "data": info, "environment": environment(), "model": plan,
@@ -435,6 +444,10 @@ def main():
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", device_id=device, timeout=timedelta(minutes=5))
     try:
+        if dist.get_rank() == 0:
+            print_training_config(cfg, TARGETS, world_size=dist.get_world_size())
+            print("Thiết bị: " + " | ".join(
+                f"cuda:{i}={torch.cuda.get_device_name(i)}" for i in range(cfg["gpu_count"])), flush=True)
         from .parallel_check import check_parallel_backend
         cfg["distributed_preflight"] = check_parallel_backend(device)
         train_parallel(cfg, device)
