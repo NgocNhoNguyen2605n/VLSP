@@ -33,18 +33,67 @@ def fsdp_worker(rank, directory, mode):
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
-    from baseline.parallel import ParallelScaler, local_tensor, train_parallel
+    from baseline.parallel import ParallelScaler, local_tensor, train_parallel, synchronize_adapter_gradients
     from baseline.runtime import read_config, arguments
     root = Path(directory)
     dist.init_process_group("gloo", init_method=f"file://{root / 'rendezvous'}", rank=rank,
                             world_size=2, timeout=timedelta(seconds=60))
     try:
+        if mode == 'preflight':
+            from baseline.parallel_check import check_parallel_backend
+            torch.set_num_threads(1)
+            with patch('torch.distributed.reduce_scatter_tensor', side_effect=AssertionError('reduce-scatter bị cấm')):
+                result = check_parallel_backend(torch.device('cpu'))
+            assert result['status'] == 'passed' and result['backend'] == 'gloo'
+            return
+        if mode == 'replicated':
+            weight = torch.nn.Parameter(torch.ones(4))
+            conditional = torch.nn.Parameter(torch.ones(3))
+            unused = torch.nn.Parameter(torch.ones(2))
+            params = [weight, conditional, unused]
+            weight.grad = torch.full_like(weight, rank + 1.)
+            conditional.grad = torch.full_like(conditional, 2.) if rank else None
+            synchronize_adapter_gradients(params, torch.device('cpu'), bucket_bytes=16)
+            torch.testing.assert_close(weight.grad, torch.full_like(weight, 1.5))
+            torch.testing.assert_close(conditional.grad, torch.ones_like(conditional))
+            assert unused.grad is None  # Không decay tham số unused trên cả hai rank.
+            optimizer = torch.optim.SGD(params, lr=.1, weight_decay=.1)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100)
+            scaler = ParallelScaler(scale=1, replicated=True)
+            skipped, _, _ = scaler.step(params, optimizer, scheduler, 1., torch.device('cpu'))
+            assert not skipped
+            torch.testing.assert_close(weight, torch.ones_like(weight) - .1 * (1.5 / (12**.5 + 1e-6) + .1))
+            torch.testing.assert_close(conditional, torch.ones_like(conditional) - .1 * (1 / (12**.5 + 1e-6) + .1))
+            torch.testing.assert_close(unused, torch.ones_like(unused))
+            original = weight.detach().clone()
+            weight.grad = torch.full_like(weight, float('inf') if rank else 1.)
+            synchronize_adapter_gradients(params, torch.device('cpu'), bucket_bytes=16)
+            skipped, before, after = scaler.step(params, optimizer, scheduler, 1., torch.device('cpu'))
+            assert skipped and (before, after) == (1, .5) and scheduler.last_epoch == 1
+            torch.testing.assert_close(weight, original)
+            # Nhóm cuối 5 mẫu thật: zero-weight dummy vẫn giữ gradient đúng.
+            layer = torch.nn.Linear(4, 2, bias=False)
+            with torch.no_grad():
+                layer.weight.fill_(1)
+            reference = torch.nn.Linear(4, 2, bias=False)
+            with torch.no_grad():
+                reference.weight.fill_(1)
+            inputs = torch.arange(20, dtype=torch.float32).view(5, 4) / 10
+            reference(inputs).square().mean().backward()
+            for step in range(3):
+                index = 2 * step + rank
+                valid = index < 5
+                loss = layer(inputs[index if valid else 0:index + 1 if valid else 1]).square().mean()
+                (loss * (2 * int(valid) / 5)).backward()
+            synchronize_adapter_gradients(list(layer.parameters()), torch.device('cpu'))
+            torch.testing.assert_close(layer.weight.grad, reference.weight.grad)
+            return
         if mode == "gradient":
             import copy
             from peft import LoraConfig, get_peft_model
             from transformers import Qwen2Config, Qwen2ForCausalLM
             from baseline.model import ChunkedLoss, TARGETS, configure_attention
-            from baseline.parallel import shard_model
+            from baseline.parallel import shard_model, synchronize_adapter_gradients
             from baseline.data import collate_batch
             torch.manual_seed(42)
             configure_attention()
@@ -68,7 +117,6 @@ def fsdp_worker(rank, directory, mode):
                                      'labels': [-100] * 3 + [5] * count})
                 return collate_batch(features, 0)
             for step in range(4):
-                root_module.set_requires_gradient_sync(step == 3)
                 with torch.autocast('cpu', dtype=torch.float16):
                     loss = learner(**batch(step, rank))
                 (loss / 4).backward()
@@ -76,11 +124,13 @@ def fsdp_worker(rank, directory, mode):
                     with torch.autocast('cpu', dtype=torch.float16):
                         loss = reference(**batch(step, owner))
                     (loss / 8).backward()
+            params = [p for p in model.parameters() if p.requires_grad]
+            synchronize_adapter_gradients(params, torch.device('cpu'), bucket_bytes=256)
             expected = dict(reference.model.named_parameters())
             for name, parameter in model.named_parameters():
                 if parameter.requires_grad:
                     key = name.replace('._checkpoint_wrapped_module', '')
-                    actual = parameter.grad.full_tensor()
+                    actual = parameter.grad
                     torch.testing.assert_close(actual, expected[key].grad, rtol=.02, atol=2e-5)
                     if 'lora_B' in name:
                         assert actual.abs().sum() > 0
@@ -152,7 +202,8 @@ def fsdp_worker(rank, directory, mode):
             return json.dumps({'answer': answer, 'unit': 'V', 'explanation': 'Giải'}), 0.1, count, finished
         with patch("baseline.parallel.load_tokenizer", return_value=ToyTokenizer()), \
              patch("baseline.parallel.load_model", fresh), \
-             patch("baseline.validation.generate_once", generation):
+             patch("baseline.validation.generate_once", generation), \
+             patch("torch.distributed.reduce_scatter_tensor", side_effect=AssertionError('FSDP không được reduce-scatter LoRA')):
             train_parallel(cfg, torch.device('cpu'))
             best = json.loads((Path(cfg['output_dir']) / 'best_checkpoint.json').read_text())
             final = {**cfg, 'training_stage': 'final', 'output_dir': str(root / 'final'), 'epochs': best['epoch']}
@@ -237,6 +288,16 @@ class ParallelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(fsdp_worker, args=(directory, 'gradient'), nprocs=2, join=True)
 
+    def test_replicated_gradients_missing_parameters_clipping_overflow_and_partial_batch(self):
+        import torch.multiprocessing as mp
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(fsdp_worker, args=(directory, 'replicated'), nprocs=2, join=True)
+
+    def test_backend_preflight_against_reference_without_reduce_scatter(self):
+        import torch.multiprocessing as mp
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(fsdp_worker, args=(directory, 'preflight'), nprocs=2, join=True)
+
     def test_length_grouped_batches_reduce_padding_and_keep_partial_batch_last(self):
         from baseline.parallel import parallel_batches
         features = [{'input_ids': list(range(2 + (i * 71) % 509)), 'id': i} for i in range(133)]
@@ -304,6 +365,11 @@ class ParallelTests(unittest.TestCase):
             self.assertEqual(final['successful_optimizer_steps'], 6 if batch_size == 1 else 3)
             self.assertEqual(search['model']['activation_checkpointing'], 'inside FSDP; non-reentrant')
             self.assertTrue(search['group_by_length'])
+            self.assertTrue(search['model']['replicated_lora'])
+            for worker in range(2):
+                progress = json.loads((root / f'final/rank-{worker}-progress.json').read_text())
+                self.assertEqual(progress['phase'], 'complete')
+                self.assertEqual(progress['epoch'], 3)
             self.assertIsNone(final['split'])
             self.assertEqual(set(final['data']), {'train'})
             self.assertEqual(len(json.loads((root / 'search/train_log.json').read_text())), 5)

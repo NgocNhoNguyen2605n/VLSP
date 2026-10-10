@@ -181,6 +181,12 @@ def train(cfg):
 def main():
     """Entry point chạy bằng python -m baseline.train."""
     cfg = read_config(arguments("Train baseline LoRA ViPRA").parse_args())
+    if "training_stage" not in cfg:
+        # Notebook cũ gọi train trực tiếp vẫn phải chạy quy trình chọn best epoch.
+        from .experiment import run_experiment
+        print("Train mặc định: chia 90/10, chọn best epoch rồi retrain từ backbone gốc.", flush=True)
+        run_experiment(cfg)
+        return
     if cfg.get("parallel_training") == "fsdp":
         from .parallel import launch_training
         launch_training(cfg=cfg)

@@ -65,6 +65,12 @@ def generate_once(model, tokenizer, question, cfg):
 def evaluate(run_dir, result_dir=None, data_root=None):
     """Chấm mọi dòng dev; báo riêng content đúng và đúng trong giới hạn thời gian."""
     run_dir = Path(run_dir)
+    if not (run_dir / "run.json").is_file() and (run_dir / "experiment.json").is_file():
+        experiment = json.loads((run_dir / "experiment.json").read_text(encoding="utf-8"))
+        if experiment.get("status") != "complete":
+            raise RuntimeError("Experiment chưa hoàn tất; không chấm adapter trước khi retrain xong.")
+        run_dir = run_dir / "final"
+        print(f"Evaluate adapter retrain cuối: {run_dir}", flush=True)
     if not (run_dir / "run.json").is_file():
         raise FileNotFoundError(f"{run_dir} thiếu run.json; --run-dir phải trùng --output-dir lúc train.")
     if not (run_dir / "adapter" / "adapter_config.json").is_file():

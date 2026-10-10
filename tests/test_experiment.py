@@ -62,6 +62,59 @@ class SplitTests(unittest.TestCase):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_legacy_train_cli_runs_experiment_and_internal_stages_do_not_recurse(self):
+        from baseline.train import main
+        cfg = json.loads(Path('configs/baseline.json').read_text())
+        with patch('sys.argv', ['baseline.train']), patch('baseline.train.read_config', return_value=cfg), \
+             patch('baseline.experiment.run_experiment') as experiment, \
+             patch('baseline.parallel.launch_training') as launcher, contextlib.redirect_stdout(io.StringIO()):
+            main()
+            experiment.assert_called_once_with(cfg)
+            launcher.assert_not_called()
+        for stage in ('single', 'search', 'final'):
+            worker_cfg = {**cfg, 'training_stage': stage}
+            with patch('sys.argv', ['baseline.train']), patch('baseline.train.read_config', return_value=worker_cfg), \
+                 patch('baseline.experiment.run_experiment') as experiment, \
+                 patch('baseline.parallel.launch_training') as launcher:
+                main()
+                experiment.assert_not_called()
+                launcher.assert_called_once_with(cfg=worker_cfg)
+        worker_cfg = {**cfg, 'parallel_training': 'model', 'training_stage': 'search'}
+        with patch('sys.argv', ['baseline.train']), patch('baseline.train.read_config', return_value=worker_cfg), \
+             patch('baseline.experiment.run_experiment') as experiment, patch('baseline.train.train') as train:
+            main()
+            experiment.assert_not_called()
+            train.assert_called_once_with(worker_cfg)
+
+    def test_legacy_evaluate_parent_uses_final_adapter_and_rejects_incomplete_experiment(self):
+        import hashlib
+        from baseline.evaluate import evaluate
+        from baseline.runtime import save_json
+        cfg = json.loads(Path('configs/baseline.json').read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_json(root / 'experiment.json', {'status': 'retraining'})
+            with self.assertRaisesRegex(RuntimeError, 'Experiment chưa hoàn tất'):
+                evaluate(root)
+            save_json(root / 'experiment.json', {'status': 'complete'})
+            save_json(root / 'final/adapter/adapter_config.json', {})
+            save_json(root / 'final/run.json', {'training_status': 'complete', 'config': cfg, 'data': {},
+                      'template_sha256': hashlib.sha256(b'toy-template').hexdigest()})
+            class Tokenizer:
+                chat_template = 'toy-template'
+            rows = SplitTests.rows(1)
+            with patch('baseline.evaluate.setup_seed'), patch('baseline.evaluate.environment', return_value={}), \
+                 patch('baseline.evaluate.load_data', return_value=({'train': rows, 'dev': rows}, {})), \
+                 patch('baseline.evaluate.load_tokenizer', return_value=Tokenizer()), \
+                 patch('baseline.evaluate.load_model', return_value=(object(), {})) as loader, \
+                 patch('baseline.evaluate.generate_once', return_value=(
+                     '{"answer":"1","unit":"V","explanation":"Giải"}', .1, 5, True)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result = evaluate(root)
+            loader.assert_called_once_with(cfg, adapter=root / 'final/adapter')
+            self.assertEqual(result['content_tolerant'], 1)
+            self.assertTrue((root / 'final/evaluation/metrics.json').is_file())
+
     def test_failed_search_does_not_start_final_training(self):
         from baseline.experiment import run_experiment
 
