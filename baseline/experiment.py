@@ -13,6 +13,11 @@ from .validation import checkpoint_rank
 
 def run_training(config_path):
     """Mỗi run là tiến trình riêng để trả VRAM trước khi nạp lại backbone."""
+    cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    if cfg.get("parallel_training") == "fsdp":
+        from .parallel import launch_training
+        launch_training(config_path)
+        return
     subprocess.run([sys.executable, "-m", "baseline.train", "--config", str(config_path)],
                    cwd=Path(__file__).resolve().parents[1], check=True)
 

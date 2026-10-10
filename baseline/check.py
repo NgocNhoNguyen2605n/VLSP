@@ -16,8 +16,9 @@ def main():
         print(f"{split}: {len(rows)} mẫu | max={max(sizes)} token | "
               f"bỏ answer rỗng={info[split]['skipped_ids']}", flush=True)
     _, _, plan = backbone_plan(cfg)
+    weights = plan.get("fsdp_fp16_weight_gib_per_gpu", plan["fp16_weight_gib_per_gpu"])
     print(f"Backbone ngôn ngữ: {plan['base_parameters']:,} tham số; "
-          f"FP16 mỗi GPU: {[round(n, 2) for n in plan['fp16_weight_gib_per_gpu']]} GiB "
+          f"FP16 mỗi GPU ({cfg.get('parallel_training', 'model parallel')}): {[round(n, 2) for n in weights]} GiB "
           "(chưa gồm activation/adapter).", flush=True)
     if not plan["within_8b_backbone"]:
         print("Chỉ thử nghiệm nội bộ: backbone vượt 8B.", flush=True)

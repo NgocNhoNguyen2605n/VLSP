@@ -58,9 +58,13 @@ def backbone_plan(cfg):
     del skeleton
     if count > 8_000_000_000 and not cfg["internal_experiment"]:
         raise ValueError("Backbone vượt 8B; chỉ được chạy với internal_experiment=true.")
-    return text, mapping, {"base_parameters": count,
-                           "within_8b_backbone": count <= 8_000_000_000,
-                           "fp16_weight_gib_per_gpu": [n * 2 / 2**30 for n in sizes]}
+    plan = {"base_parameters": count, "within_8b_backbone": count <= 8_000_000_000,
+            "fp16_weight_gib_per_gpu": [n * 2 / 2**30 for n in sizes]}
+    if cfg.get("parallel_training") == "fsdp":
+        head_size = text.vocab_size * text.hidden_size
+        plan["fsdp_fp16_weight_gib_per_gpu"] = [
+            ((count - head_size) / cfg["gpu_count"] + head_size) * 2 / 2**30] * cfg["gpu_count"]
+    return text, mapping, plan
 
 
 def require_gpus(cfg, plan):
@@ -74,14 +78,16 @@ def require_gpus(cfg, plan):
                                "+ ít nhất 2 GiB cho activation. Giải phóng GPU trước.")
 
 
-def load_model(cfg, training=False, adapter=None):
+def load_model(cfg, training=False, adapter=None, cpu_init=False):
     """Nạp Qwen2.5-Math FP16 và adapter LoRA cho task văn bản."""
     text, mapping, plan = backbone_plan(cfg)
-    require_gpus(cfg, plan)
+    if not cpu_init:
+        require_gpus(cfg, plan)
     configure_attention()
     base, info = Qwen2ForCausalLM.from_pretrained(
         cfg["model_id"], revision=cfg["revision"], config=text, dtype=torch.float16,
-        device_map=mapping, attn_implementation="sdpa", output_loading_info=True)
+        device_map={"": "cpu"} if cpu_init else mapping,
+        attn_implementation="sdpa", output_loading_info=True)
     if any(info.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise RuntimeError(f"Checkpoint không nạp đầy đủ: {info}")
     if training:

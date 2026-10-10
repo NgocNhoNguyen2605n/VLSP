@@ -1,0 +1,313 @@
+"""FSDP2: hai GPU học các batch riêng, chia trọng số FP16 và gradient LoRA."""
+
+from .runtime import arguments, environment, read_config, save_json, setup_seed
+
+import gc
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import timedelta
+from functools import partial
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.tensor import DTensor
+from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
+
+from .data import apply_training_split, collate_batch, encode_sample, load_data
+from .model import ChunkedLoss, load_model, load_tokenizer
+from .validation import checkpoint_rank, validate_epoch
+
+
+def launch_training(config_path=None, cfg=None):
+    """torchrun tạo một worker trên mỗi GPU; CLI train và experiment cùng dùng."""
+    if cfg is None:
+        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    if cfg["gpu_count"] != 2:
+        raise ValueError("FSDP baseline yêu cầu gpu_count=2.")
+    if torch.cuda.device_count() < 2:
+        raise RuntimeError("FSDP cần 2 GPU CUDA; hãy chọn Kaggle T4 x2.")
+    with tempfile.TemporaryDirectory(prefix="vipra-fsdp-") as directory:
+        if config_path is None:
+            config_path = Path(directory) / "config.json"
+            save_json(config_path, cfg)
+        command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
+                   "--nnodes=1", "--nproc_per_node=2", "--module", "baseline.parallel",
+                   "--config", str(Path(config_path).resolve())]
+        env = os.environ.copy()
+        env.update(PYTHONHASHSEED=str(cfg["seed"]))
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+        subprocess.run(command, cwd=Path(__file__).resolve().parents[1], env=env, check=True)
+
+
+def primary_action(action):
+    """Chỉ rank 0 ghi file; báo lỗi cho cả hai rank trước collective tiếp theo."""
+    payload = [None]
+    if dist.get_rank() == 0:
+        try:
+            payload[0] = {"value": action(), "error": None}
+        except Exception as error:
+            payload[0] = {"error": f"{type(error).__name__}: {error}"}
+    dist.broadcast_object_list(payload, src=0)
+    if payload[0]["error"]:
+        raise RuntimeError(payload[0]["error"])
+    return payload[0].get("value")
+
+
+def parallel_batches(features, batch_size, world_size, rank, seed, epoch):
+    """Không lặp/bỏ mẫu: rank thiếu mẫu cuối chạy dummy với trọng số loss bằng 0."""
+    indices = torch.randperm(len(features), generator=torch.Generator().manual_seed(seed + epoch)).tolist()
+    width = batch_size * world_size
+    for offset in range(0, len(indices), width):
+        selected = indices[offset + rank * batch_size:offset + (rank + 1) * batch_size]
+        valid = len(selected)
+        yield ([features[index] for index in selected] if selected else [features[indices[0]]]), valid
+
+
+def shard_model(model, mesh, device):
+    """Shard từng decoder rồi Qwen2Model; head frozen được giữ đầy đủ cho chunked loss."""
+    base = model.get_base_model()
+    if base.config.tie_word_embeddings:
+        raise ValueError("FSDP pipeline yêu cầu embedding/head không dùng chung trọng số như Qwen2.5-Math.")
+    policy = MixedPrecisionPolicy(reduce_dtype=torch.float32, cast_forward_inputs=False)
+    for layer in base.model.layers:
+        layer.to(device)
+        fully_shard(layer, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
+    for name, module in base.model.named_children():
+        if name != "layers":
+            module.to(device)
+    fully_shard(base.model, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
+    # Head không có gradient và được gọi nhiều lần theo số assistant token mỗi rank.
+    # Replicate head tránh collective không khớp khi số chunk giữa các rank khác nhau.
+    base.lm_head.to(device)
+    return base.model
+
+
+def local_tensor(tensor):
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+class ParallelScaler:
+    """Scale FP16; unscale shard LoRA FP32 và đồng bộ overflow giữa mọi rank."""
+    def __init__(self, scale=128.0):
+        self.scale = float(scale)
+        self.good_steps = 0
+
+    def step(self, params, optimizer, scheduler, max_norm, device):
+        old_scale = self.scale
+        squared = torch.zeros((), device=device, dtype=torch.float64)
+        failed = torch.zeros((), device=device, dtype=torch.int32)
+        with torch.no_grad():
+            for parameter in params:
+                if parameter.grad is None:
+                    continue
+                gradient = local_tensor(parameter.grad)
+                gradient.div_(self.scale)
+                failed = torch.maximum(failed, (~torch.isfinite(gradient).all()).to(dtype=torch.int32))
+                squared += gradient.double().square().sum()
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+            dist.all_reduce(squared, op=dist.ReduceOp.SUM)
+            norm = squared.sqrt()
+            skipped = bool(failed.item()) or not bool(torch.isfinite(norm).item())
+            if skipped:
+                self.scale *= 0.5
+                self.good_steps = 0
+            else:
+                coefficient = (max_norm / (norm + 1e-6)).clamp(max=1).float()
+                for parameter in params:
+                    if parameter.grad is not None:
+                        local_tensor(parameter.grad).mul_(coefficient)
+                optimizer.step()
+                scheduler.step()
+                self.good_steps += 1
+                if self.good_steps == 2000:
+                    self.scale *= 2
+                    self.good_steps = 0
+        optimizer.zero_grad(set_to_none=True)
+        return skipped, old_scale, self.scale
+
+
+def save_adapter(model, tokenizer, directory, include_tokenizer=False):
+    """Gather chỉ LoRA lên CPU, không gather toàn bộ backbone 7B để lưu."""
+    state = {}
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            full = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+            if dist.get_rank() == 0:
+                state[name] = full.detach().cpu().clone()
+    def write():
+        model.save_pretrained(directory, state_dict=state)
+        if include_tokenizer:
+            tokenizer.save_pretrained(directory)
+    primary_action(write)
+
+
+def train_parallel(cfg, device):
+    """Một search/final run trên nhóm distributed đã khởi tạo; CPU chỉ dùng cho test."""
+    rank, world = dist.get_rank(), dist.get_world_size()
+    primary = rank == 0
+    if world != cfg["gpu_count"]:
+        raise ValueError("Số worker khác gpu_count trong cấu hình.")
+    setup_seed(cfg["seed"])
+    output = Path(cfg["output_dir"])
+    def check_output():
+        if output.exists() and any(output.iterdir()):
+            raise FileExistsError(f"{output} đã có dữ liệu; hãy chọn --output-dir mới.")
+    primary_action(check_output)
+    stage = cfg.get("training_stage", "single")
+    if stage not in ("single", "search", "final"):
+        raise ValueError("training_stage phải là single, search hoặc final.")
+    splits, info = load_data(cfg, splits=("train",) if stage != "single" else ("train", "dev"))
+    rows, validation, split = splits["train"], [], None
+    if stage == "search":
+        rows, validation, split = apply_training_split(rows, info["train"], cfg["split_file"])
+    tokenizer = load_tokenizer(cfg)
+    features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in rows]
+    validation_features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in validation]
+    validation_loader = DataLoader(validation_features, batch_size=cfg["batch_size"], shuffle=False,
+                                  num_workers=0, collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id))
+    mesh = init_device_mesh(device.type, (world,))
+    model = plan = root = None
+    # CPU init lần lượt tránh hai bản backbone đầy đủ cùng chiếm RAM Kaggle.
+    for loading_rank in range(world):
+        if rank == loading_rank:
+            print(f"Rank {rank}: nạp backbone từ CPU, shard FSDP sang {device}...", flush=True)
+            model, plan = load_model(cfg, training=True, cpu_init=True)
+            head_size = model.get_output_embeddings().weight.numel()
+            plan.update(parallelism="FSDP2", world_size=world, replicated_frozen_head=True,
+                        fp16_weight_gib_per_gpu=[((plan["base_parameters"] - head_size) / world + head_size) * 2 / 2**30] * world)
+            if device.type == "cuda":
+                free = torch.cuda.mem_get_info(device)[0] / 2**30
+                needed = plan["fp16_weight_gib_per_gpu"][rank] + 2
+                if free < needed:
+                    raise RuntimeError(f"Rank {rank}: còn {free:.1f} GiB, cần ít nhất {needed:.1f} GiB trước FSDP.")
+            root = shard_model(model, mesh, device)
+            gc.collect()
+        dist.barrier()
+    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"], foreach=False)
+    accumulation = cfg["gradient_accumulation_steps"]
+    width = cfg["batch_size"] * world
+    micro_steps = math.ceil(len(rows) / width)
+    total_steps = math.ceil(micro_steps / accumulation) * cfg["epochs"]
+    scheduler = get_cosine_schedule_with_warmup(optimizer,
+        num_warmup_steps=math.ceil(total_steps * cfg["warmup_ratio"]), num_training_steps=total_steps)
+    scaler = ParallelScaler(cfg.get("fp16_init_scale", 128.0))
+    learner = ChunkedLoss(model, cfg["loss_chunk_size"])
+    manifest = {"config": cfg, "data": info, "environment": environment(), "model": plan,
+                "template_sha256": hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
+                "effective_batch_size": width * accumulation, "training_stage": stage,
+                "training_samples": len(rows), "split": split,
+                "initialization": "backbone gốc và LoRA mới; không nạp checkpoint search",
+                "selection": "validation answer+unit accuracy" if validation else "final epoch",
+                "training_status": "running"}
+    primary_action(lambda: save_json(output / "run.json", manifest))
+    successful, skipped_steps, consecutive_skips, history, best = 0, 0, 0, [], None
+    try:
+        if primary:
+            print(f"FSDP {world} GPU | {len(rows)} train / {len(validation)} validation | "
+                  f"{cfg['epochs']} epoch | effective batch={width * accumulation}", flush=True)
+        for epoch in range(1, cfg["epochs"] + 1):
+            learner.train()
+            optimizer.zero_grad(set_to_none=True)
+            totals = torch.zeros(2, dtype=torch.float64, device=device)
+            last_report = time.monotonic()
+            for index, (selected, valid_samples) in enumerate(parallel_batches(
+                    features, cfg["batch_size"], world, rank, cfg["seed"], epoch)):
+                batch = {key: value.to(device) for key, value in collate_batch(
+                    selected, tokenizer.pad_token_id).items()}
+                group_start = index // accumulation * accumulation
+                group_samples = min(accumulation * width, len(rows) - group_start * width)
+                last = (index + 1) % accumulation == 0 or index + 1 == micro_steps
+                root.set_requires_gradient_sync(last)
+                with torch.autocast(device.type, dtype=torch.float16):
+                    loss = learner(**batch)
+                failed = (~torch.isfinite(loss)).to(dtype=torch.int32)
+                dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+                if failed.item():
+                    raise FloatingPointError(f"Loss không hữu hạn tại epoch {epoch}, micro-step {index + 1}.")
+                tokens = int(batch["labels"][:, 1:].ne(-100).sum()) if valid_samples else 0
+                totals[0] += loss.detach().double() * tokens
+                totals[1] += tokens
+                # FSDP lấy trung bình gradient giữa rank; nhân world để nhóm cuối vẫn chia đúng số mẫu thật.
+                (loss * (world * valid_samples / group_samples) * scaler.scale).backward()
+                if last:
+                    skipped, old_scale, scale = scaler.step(params, optimizer, scheduler, cfg["max_grad_norm"], device)
+                    if skipped:
+                        skipped_steps += 1
+                        consecutive_skips += 1
+                        if primary:
+                            print(f"FP16 overflow: {old_scale:g} -> {scale:g}; bỏ bước trên cả {world} GPU.", flush=True)
+                        if consecutive_skips >= cfg.get("max_consecutive_skips", 8):
+                            raise FloatingPointError("Gradient không hữu hạn nhiều bước liên tiếp; dừng cả hai rank.")
+                    else:
+                        successful += 1
+                        consecutive_skips = 0
+                now = time.monotonic()
+                if primary and (index == 0 or now - last_report >= 60
+                                or last and ((successful + skipped_steps) % cfg["log_every"] == 0)
+                                or index + 1 == micro_steps):
+                    print(f"Epoch {epoch}/{cfg['epochs']} | mẫu {min((index + 1) * width, len(rows))}/{len(rows)} | "
+                          f"Train step {successful + skipped_steps}/{total_steps} | "
+                          f"cập nhật={successful} | bỏ={skipped_steps}", flush=True)
+                    last_report = now
+            root.set_requires_gradient_sync(True)
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+            if not successful:
+                raise FloatingPointError("Chưa có bước cập nhật thành công; không lưu adapter.")
+            record = {"epoch": epoch, "loss": (totals[0] / totals[1]).item(),
+                      "successful_optimizer_steps": successful, "skipped_optimizer_steps": skipped_steps,
+                      "grad_scale": scaler.scale}
+            checkpoint = output / f"epoch-{epoch}"
+            save_adapter(model, tokenizer, checkpoint)
+            if validation:
+                # FSDP collectives yêu cầu mọi rank tham gia generation; synced_gpus xử lý EOS/deadline khác nhau.
+                result = validate_epoch(learner, validation_loader, validation, tokenizer, cfg, epoch,
+                                        output / "validation" / f"epoch-{epoch}", primary=primary)
+                result = primary_action(lambda: result)
+                result["checkpoint"] = str(checkpoint.resolve())
+                record["validation"] = result
+                if best is None or checkpoint_rank(result) > checkpoint_rank(best):
+                    best = result.copy()
+                    primary_action(lambda: save_json(output / "best_checkpoint.json", best))
+            history.append(record)
+            primary_action(lambda: save_json(output / "train_log.json", history))
+            if primary:
+                print(f"Epoch {epoch} hoàn tất | loss={record['loss']:.4f}" +
+                      (f" | đúng={result['content_tolerant']}/{result['total']} | best epoch={best['epoch']}" if validation else ""), flush=True)
+        save_adapter(model, tokenizer, output / "adapter", include_tokenizer=True)
+        manifest.update(training_status="complete", successful_optimizer_steps=successful,
+                        skipped_optimizer_steps=skipped_steps, best_checkpoint=best)
+        primary_action(lambda: save_json(output / "run.json", manifest))
+    except Exception as error:
+        if primary:
+            manifest.update(training_status="failed", failure=str(error))
+            save_json(output / "run.json", manifest)
+        raise
+
+
+def main():
+    cfg = read_config(arguments("FSDP LoRA ViPRA worker").parse_args())
+    if "LOCAL_RANK" not in os.environ or not torch.cuda.is_available():
+        raise RuntimeError("Worker FSDP phải được khởi chạy bằng torchrun trên GPU CUDA.")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", timeout=timedelta(minutes=30))
+    try:
+        train_parallel(cfg, torch.device("cuda", local_rank))
+    finally:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

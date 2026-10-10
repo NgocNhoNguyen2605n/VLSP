@@ -1,5 +1,5 @@
 # Giữ PyTorch CUDA sẵn có của Kaggle; không cài bản CPU vào Kaggle.
-torch>=2.5,<3
+torch>=2.8,<3
 transformers==5.19.0
 peft==0.21.2
 accelerate==1.15.0

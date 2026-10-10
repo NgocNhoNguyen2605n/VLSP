@@ -31,6 +31,10 @@ def read_config(args):
             cfg[name] = getattr(args, name)
     if type(cfg["seed"]) is not int or not 0 <= cfg["seed"] < 2**32:
         raise ValueError("seed phải là số nguyên trong [0, 2**32).")
+    if cfg.get("parallel_training", "model") not in ("model", "fsdp"):
+        raise ValueError("parallel_training phải là model hoặc fsdp.")
+    if cfg.get("parallel_training") == "fsdp" and cfg["gpu_count"] != 2:
+        raise ValueError("FSDP baseline yêu cầu gpu_count=2.")
     if not cfg.get("revision") or cfg["revision"] == "main":
         raise ValueError("Cần revision cố định để tránh model thay đổi giữa các lần chạy.")
     for name in ("max_length", "epochs", "batch_size", "gradient_accumulation_steps",

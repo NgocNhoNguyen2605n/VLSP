@@ -16,8 +16,8 @@ Repo dùng để khảo sát dữ liệu và xây dựng baseline fine-tuning LL
 
 Baseline: `Qwen/Qwen2.5-Math-7B-Instruct`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Model/tokenizer/template được cố định tại revision `ef9926d75ab1d54532f6a30dd5e760355eb9aa4d`.
 
-- Train **5 epoch với seed 42**, chọn epoch có điểm validation cao nhất. Batch 1, tích lũy gradient 8 (effective batch 8), LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
-- Backbone có **7.615.616.512 tham số**, dưới giới hạn 8B. Trọng số FP16 khoảng **14,19 GiB tổng**, chia cố định trên hai T4; chưa gồm activation, adapter và optimizer. Micro-batch 1, gradient checkpointing và chunked loss giảm VRAM; vẫn cần đo VRAM thực tế trên Kaggle.
+- Train **5 epoch với seed 42**, chọn epoch có điểm validation cao nhất. Batch 1/GPU, tích lũy gradient 4/GPU trên 2 GPU (effective batch 8), LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
+- Backbone có **7.615.616.512 tham số**, dưới giới hạn 8B. Trọng số FP16 khoảng **14,19 GiB tổng**. Training dùng **FSDP2**, hai T4 xử lý các batch khác nhau đồng thời và chia trọng số theo shard. Head frozen được nhân bản để chunked loss không cần collective theo số token; riêng trọng số khoảng **7,60 GiB/GPU**, chưa gồm activation, adapter, optimizer và buffer giao tiếp. Micro-batch 1, gradient checkpointing và chunked loss giảm VRAM; vẫn cần đo VRAM thực tế trên Kaggle.
 - Dùng chat template Qwen2.5-Math chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Sinh greedy một lần mỗi câu; không dùng công cụ tính toán bên ngoài.
 - Model card chủ yếu hỗ trợ toán tiếng Anh/Trung. Khả năng giải vật lý tiếng Việt cần được đo trên dev; chưa có kết quả để khẳng định cải thiện so với backbone trước.
 
@@ -32,7 +32,7 @@ Sau khi clone repo về chạy lần lượt:
 ```python
 %cd /kaggle/working/VLSP
 %pip uninstall -q -y torchao  # LoRA FP16 không cần torchao; bản cũ gây lỗi PEFT.
-%pip install -q -r requirements.txt
+%pip install -q -r requirements.txt  # FSDP2 yêu cầu PyTorch CUDA >= 2.8.
 ```
 
 ```python
@@ -49,12 +49,22 @@ Sau khi clone repo về chạy lần lượt:
 4. **Train lại từ backbone gốc + LoRA mới**, trên toàn bộ **676 mẫu hợp lệ (608 train + 68 validation nội bộ)**, giữ seed 42 và dùng **số epoch của checkpoint thắng**. Ví dụ epoch 3 tốt nhất thì train lại đúng 3 epoch trên dữ liệu đầy đủ. Không nạp trọng số checkpoint search; learning rate/rank/batch và các hyperparameter khác giữ theo cấu hình search. Optimizer/scheduler được tạo mới cho kích thước dữ liệu đầy đủ.
 5. Đánh giá adapter cuối trên **dev 339 mẫu** bằng lệnh evaluate riêng. Dev không được đọc trong search/retrain và không dùng chọn checkpoint. Điểm validation đã dùng để chọn model và dữ liệu này đã được học khi train cuối, nên không phải điểm đánh giá độc lập của adapter cuối.
 
-Run tìm epoch và run train cuối chạy **tuần tự trong hai tiến trình riêng** để giải phóng VRAM trước khi khởi tạo lại backbone. Validation generation sau mỗi epoch làm tăng thời gian chạy. `--output-dir` của `baseline.experiment` là thư mục gốc; kết quả train cuối nằm trong thư mục con `final/`. Mỗi lần thử cần một thư mục gốc mới. `baseline.train` là lệnh cho một run riêng, được experiment gọi với cấu hình tương ứng.
+Run tìm epoch và run train cuối chạy **tuần tự** để giải phóng VRAM trước khi khởi tạo lại backbone. Trong mỗi run, launcher tự chạy `torchrun` với **2 worker FSDP song song**, một worker trên mỗi GPU; không cần tự thêm lệnh torchrun vào notebook. Validation generation sau mỗi epoch làm tăng thời gian chạy. `--output-dir` của `baseline.experiment` là thư mục gốc; kết quả train cuối nằm trong thư mục con `final/`. Mỗi lần thử cần một thư mục gốc mới. `baseline.train` là lệnh cho một run riêng, được experiment gọi với cấu hình tương ứng.
+
+## Chạy song song và tái lập
+
+- `parallel_training="fsdp"` là mặc định, cần PyTorch CUDA **>= 2.8** và 2 GPU. `baseline.experiment` và `baseline.train` tự khởi chạy hai worker bằng torchrun; `baseline.parallel` là module worker.
+- Mỗi epoch shuffle bằng seed cố định và epoch, rồi chia batch rời nhau cho hai rank. Nhóm cuối thiếu mẫu dùng dummy với loss weight 0, không lặp/bỏ mẫu thật; gradient được chia theo số mẫu thật trong nhóm.
+- Backbone nạp trên CPU lần lượt từng rank rồi shard từng lớp sang GPU, tránh đưa cả backbone đầy đủ lên mỗi T4 hoặc giữ hai bản CPU đầy đủ cùng lúc. Backbone FP16, RMSNorm/LoRA FP32, AdamW chỉ học LoRA. Gradient reduction dùng FP32.
+- Overflow được đồng bộ: nếu một shard có NaN/Inf, cả hai rank cùng bỏ optimizer step, giảm loss scale và không tăng scheduler. Gradient clipping dùng norm toàn cục trên mọi shard.
+- Checkpoint chỉ gather các tham số LoRA về CPU; rank 0 ghi adapter/JSON. Không gather cả backbone 7B để lưu. Adapter cuối vẫn nạp bằng PEFT thông thường.
+- Validation cần mọi rank tham gia cùng câu hỏi vì FSDP có collective. Generation dùng `synced_gpus=True` để tránh kẹt khi EOS/deadline khác nhau; rank 0 ghi prediction và quyết định điểm. Validation không chia câu hỏi riêng cho từng GPU. Đánh giá dev sau cùng dùng model chia lớp trong một tiến trình như trước.
+- Seed/split/revision được cố định; giữ effective batch 8. `deterministic_algorithms(..., warn_only=True)` vẫn chỉ cảnh báo kernel không xác định. Không bảo đảm giống từng bit hoặc khớp kết quả của cách chạy chia lớp trước đây. FSDP có chi phí truyền trọng số, cần đo tốc độ thực tế trên T4; không mặc nhiên nhanh gấp đôi.
 
 ## Đánh giá và độ ổn định
 
 - Attention dùng **SDPA math**, giữ trung gian FP32 để tránh QK^T tràn FP16 trước softmax. Tắt reduced-precision reduction của GEMM FP16. Trọng số backbone vẫn FP16; không yêu cầu FlashAttention/BF16 trên T4. SDPA math có thể tăng thời gian và VRAM so với các kernel fused.
-- Nếu loss vẫn NaN/Inf, chạy lại riêng batch lỗi để báo projection/norm đầu tiên sinh giá trị không hữu hạn, ghi lỗi vào `run.json` và dừng. Đây là lỗi forward; giảm learning rate hoặc GradScaler không sửa trực tiếp. Sau một run thất bại, dùng thư mục output mới.
+- Nếu loss vẫn NaN/Inf, cả hai rank dừng ở cùng micro-step, ghi lỗi vào `run.json`. Nhánh một tiến trình còn có chẩn đoán projection/norm; không chạy lại riêng một rank FSDP vì có collective. Đây là lỗi forward; giảm learning rate hoặc GradScaler không sửa trực tiếp. Sau một run thất bại, dùng thư mục output mới.
 - `content_exact`: chuỗi đáp án khớp sau NFC/khoảng trắng, đơn vị khớp sau các alias ASCII đã khai báo.
 - `content_tolerant`: cho phép biểu thức số an toàn và `abs(pred-gold) <= atol + rtol*abs(gold)`. Mặc định **rtol=0,01, atol=0**; không coi đáp án rất nhỏ là 0. Dung sai này không phải quy định BTC.
 - `p1_estimate`: content đúng và trả kết quả trong giới hạn thời gian. Greedy, mỗi câu một lần, không retry. Deadline dừng ở ranh giới token; câu thực tế vượt 60 giây vẫn bị tính sai.
@@ -84,6 +94,7 @@ final/evaluation/predictions.jsonl
 | `baseline/model.py` | Chia backbone FP16, LoRA và chunked loss |
 | `baseline/train.py` | Huấn luyện và lưu adapter |
 | `baseline/experiment.py` | Chạy 5 epoch, chọn best epoch, train mới trên train + validation |
+| `baseline/parallel.py` | Launcher torchrun, FSDP2, chia batch, overflow/clipping và lưu adapter |
 | `baseline/validation.py` | Chấm validation sau mỗi epoch và xếp hạng checkpoint |
 | `baseline/evaluate.py` | Greedy trên dev, ghi predictions và metrics |
 | `baseline/metrics.py` | Parse JSON và P1 tạm thời |
@@ -91,10 +102,10 @@ final/evaluation/predictions.jsonl
 | `baseline/runtime.py` | Seed, cấu hình và manifest |
 
 
-Kiểm tra CPU (model Qwen2 nhỏ, không tải trọng số 7B):
+Kiểm tra CPU (model Qwen2 nhỏ, gồm hai tiến trình FSDP thật với Gloo, không tải trọng số 7B; test FSDP đã kiểm tra trên PyTorch 2.14):
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Nguồn: [Qwen2.5-Math-7B-Instruct model card](https://huggingface.co/Qwen/Qwen2.5-Math-7B-Instruct), [Qwen2 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen2), [PyTorch SDPA và độ chính xác](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).
+Nguồn: [PyTorch FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), [Qwen2.5-Math-7B-Instruct model card](https://huggingface.co/Qwen/Qwen2.5-Math-7B-Instruct), [Qwen2 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen2), [PyTorch SDPA và độ chính xác](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).

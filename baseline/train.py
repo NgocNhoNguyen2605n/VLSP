@@ -178,7 +178,12 @@ def train(cfg):
 
 def main():
     """Entry point chạy bằng python -m baseline.train."""
-    train(read_config(arguments("Train baseline LoRA ViPRA").parse_args()))
+    cfg = read_config(arguments("Train baseline LoRA ViPRA").parse_args())
+    if cfg.get("parallel_training") == "fsdp":
+        from .parallel import launch_training
+        launch_training(cfg=cfg)
+    else:
+        train(cfg)
 
 
 if __name__ == "__main__":

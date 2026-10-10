@@ -31,7 +31,9 @@ class Deadline(StoppingCriteria):
 
 def synchronize(gpu_count):
     """Đợi cả hai GPU để thời gian đo gồm toàn bộ tính toán CUDA."""
-    for i in range(gpu_count):
+    distributed = torch.distributed.is_initialized()
+    devices = [torch.cuda.current_device()] if distributed else range(gpu_count)
+    for i in devices:
         torch.cuda.synchronize(i)
 
 
@@ -47,10 +49,11 @@ def generate_once(model, tokenizer, question, cfg):
         do_sample=False, num_beams=1, max_new_tokens=cfg["max_new_tokens"],
         eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
         use_cache=True, temperature=None, top_p=None, top_k=None)
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+    with torch.inference_mode(), torch.autocast(tensor.device.type, dtype=torch.float16):
         output = model.generate(
             input_ids=tensor, attention_mask=torch.ones_like(tensor),
             generation_config=generation,
+            synced_gpus=torch.distributed.is_initialized(),
             stopping_criteria=StoppingCriteriaList([Deadline(start + cfg["timeout_seconds"])]))
     synchronize(cfg["gpu_count"])
     elapsed = time.perf_counter() - start
