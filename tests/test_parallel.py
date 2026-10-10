@@ -96,6 +96,7 @@ def fsdp_worker(rank, directory, mode):
             from baseline.parallel import shard_model, synchronize_adapter_gradients
             from baseline.data import collate_batch
             torch.manual_seed(42)
+            torch.set_num_threads(1)
             configure_attention()
             base = Qwen2ForCausalLM(Qwen2Config(vocab_size=16, hidden_size=16,
                 intermediate_size=24, num_hidden_layers=4, num_attention_heads=2,
@@ -122,24 +123,70 @@ def fsdp_worker(rank, directory, mode):
                                      'attention_mask': [1] * (3 + count),
                                      'labels': [-100] * 3 + [5] * count})
                 return collate_batch(features, 0)
-            for step in range(4):
-                with torch.autocast('cpu', dtype=torch.float16):
-                    loss = learner(**batch(step, rank))
-                (loss / 4).backward()
-                for owner in range(2):
-                    with torch.autocast('cpu', dtype=torch.float16):
-                        loss = reference(**batch(step, owner))
-                    (loss / 8).backward()
             params = [p for p in model.parameters() if p.requires_grad]
-            synchronize_adapter_gradients(params, torch.device('cpu'), bucket_bytes=256)
             expected = dict(reference.model.named_parameters())
-            for name, parameter in model.named_parameters():
-                if parameter.requires_grad:
-                    key = name.replace('._checkpoint_wrapped_module', '')
-                    actual = parameter.grad
-                    torch.testing.assert_close(actual, expected[key].grad, rtol=.02, atol=2e-5)
-                    if 'lora_B' in name:
-                        assert actual.abs().sum() > 0
+            optimizer = torch.optim.SGD(params, lr=.01)
+            reference_optimizer = torch.optim.SGD(reference.parameters(), lr=.01)
+            from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+            original_prefetch = FSDPParamGroup._prefetch_unshard
+            gather_name = 'all_gather_single' if hasattr(dist, 'all_gather_single') else 'all_gather_into_tensor'
+            original_gather = getattr(dist, gather_name)
+            in_prefetch, trace = False, []
+            def checked_prefetch(*args, **kwargs):
+                nonlocal in_prefetch
+                in_prefetch = True
+                try:
+                    return original_prefetch(*args, **kwargs)
+                finally:
+                    in_prefetch = False
+            def checked_gather(output, tensor, *args, **kwargs):
+                assert not in_prefetch, 'Prefetch không được tạo all-gather'
+                trace.append((output.numel(), tensor.numel(), str(tensor.dtype)))
+                return original_gather(output, tensor, *args, **kwargs)
+            with patch.object(FSDPParamGroup, '_prefetch_unshard', side_effect=checked_prefetch), \
+                 patch.object(dist, gather_name, side_effect=checked_gather):
+                for update in range(20):  # 80 micro-batches: vượt vị trí batch 69 trong log lỗi.
+                    # No-grad validation giữa optimizer steps rồi trở lại train.
+                    learner.eval()
+                    if update:
+                        with torch.inference_mode(), torch.autocast('cpu', dtype=torch.float16):
+                            learner(**batch(update, 0))
+                    learner.train()
+                    optimizer.zero_grad(set_to_none=True)
+                    reference_optimizer.zero_grad(set_to_none=True)
+                    for step in range(4):
+                        with torch.autocast('cpu', dtype=torch.float16):
+                            loss = learner(**batch(step + update, rank))
+                        # Lệch nhịp hai rank + số head chunks khác nhau.
+                        import time
+                        if (step + update) % 2 == rank:
+                            time.sleep(.01)
+                        before = len(trace)
+                        (loss * 128 / 4).backward()
+                        assert len(trace) - before == 4, (rank, update, step, trace[before:])
+                        for owner in range(2):
+                            with torch.autocast('cpu', dtype=torch.float16):
+                                loss = reference(**batch(step + update, owner))
+                            (loss * 128 / 8).backward()
+                    synchronize_adapter_gradients(params, torch.device('cpu'), bucket_bytes=256)
+                    for parameter in [*params, *reference.parameters()]:
+                        if parameter.grad is not None:
+                            parameter.grad.div_(128)
+                    for name, parameter in model.named_parameters():
+                        if parameter.requires_grad:
+                            key = name.replace('._checkpoint_wrapped_module', '')
+                            torch.testing.assert_close(parameter.grad, expected[key].grad, rtol=.03, atol=5e-5)
+                            if 'lora_B' in name:
+                                assert parameter.grad.abs().sum() > 0
+                    optimizer.step()
+                    reference_optimizer.step()
+                    for name, parameter in model.named_parameters():
+                        if parameter.requires_grad:
+                            key = name.replace('._checkpoint_wrapped_module', '')
+                            torch.testing.assert_close(parameter, expected[key], rtol=.03, atol=5e-5)
+            traces = [None, None]
+            dist.all_gather_object(traces, trace)
+            assert traces[0] == traces[1]  # cùng số/thứ tự/shape collective trên hai rank
             return
         if mode == "scaler":
             mesh = init_device_mesh("cpu", (2,))

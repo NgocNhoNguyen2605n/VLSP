@@ -91,7 +91,7 @@ def parallel_batches(features, batch_size, world_size, rank, seed, epoch, group_
 
 
 def shard_model(model, mesh, device):
-    """Checkpoint bên trong FSDP; lịch backward cố định trên cả hai rank."""
+    """Checkpoint bên trong FSDP; decoder chỉ all-gather khi backward cần lớp đó."""
     base = model.get_base_model()
     if base.config.tie_word_embeddings:
         raise ValueError("FSDP pipeline yêu cầu embedding/head không dùng chung trọng số như Qwen2.5-Math.")
@@ -120,10 +120,12 @@ def shard_model(model, mesh, device):
         raise RuntimeError("LoRA không được shard: pipeline chỉ đồng bộ gradient sau backward.")
     # Không cho FSDP tạo reduce-scatter xen với backward all-gather.
     base.model.set_requires_gradient_sync(False)
-    # Không suy lịch prefetch từ post-forward/recompute của graph từng rank.
-    base.model.set_modules_to_backward_prefetch([base.model.layers[-1]])
-    for index, layer in enumerate(base.model.layers):
-        layer.set_modules_to_backward_prefetch([base.model.layers[index - 1] if index else base.model])
+    # [] bật lại prefetch mặc định trong FSDP2, không phải tắt prefetch.
+    # Dùng embedding frozen (unshard_in_backward=False) làm target no-op:
+    # mỗi decoder vẫn unshard chính nó trước backward, không gather trước lớp khác.
+    # Tránh collective phát sinh từ hook prefetch/recompute khi graph/rank lệch nhịp.
+    for module in [base.model, base.model.embed_tokens, *base.model.layers]:
+        module.set_modules_to_backward_prefetch([base.model.embed_tokens])
     # Head không có gradient và được gọi nhiều lần theo số assistant token mỗi rank.
     # Replicate head tránh collective không khớp khi số chunk giữa các rank khác nhau.
     base.lm_head.to(device)
@@ -277,7 +279,7 @@ def train_parallel(cfg, device):
             plan.update(parallelism="FSDP2", world_size=world, replicated_frozen_head=True,
                         replicated_lora=True, gradient_sync="FP32 bucket all-reduce after backward; no FSDP reduce-scatter",
                         activation_checkpointing="inside FSDP; non-reentrant",
-                        backward_prefetch="explicit reverse decoder order",
+                        backward_prefetch="disabled via frozen embedding no-op target; decoder all-gather on demand",
                         fp16_weight_gib_per_gpu=[((plan["base_parameters"] - head_size) / world + head_size) * 2 / 2**30] * world)
             if device.type == "cuda":
                 free = torch.cuda.mem_get_info(device)[0] / 2**30

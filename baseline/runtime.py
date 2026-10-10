@@ -75,6 +75,8 @@ def print_training_config(cfg, target_modules, world_size=1):
         f"FP16: init_scale={cfg.get('fp16_init_scale', 128.0):g} | "
         f"max_consecutive_skips={cfg.get('max_consecutive_skips', 8)} | activation_checkpointing=non-reentrant",
     ]
+    if world_size > 1:
+        lines.append("FSDP: backward_prefetch=disabled | decoder all-gather on demand | LoRA FP32 all-reduce sau backward")
     if stage == "search":
         lines.extend([
             f"Split: validation_fraction={cfg.get('validation_fraction', 0.1):g} | "
