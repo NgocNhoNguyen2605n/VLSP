@@ -16,8 +16,9 @@ class ToyTokenizer:
 
     def apply_chat_template(self, messages, add_generation_prompt, **kwargs):
         # Độ dài assistant khác nhau giữa rank để kiểm tra chunked head không deadlock.
-        prefix = [1, 3, 4]
-        length = 3 + int(messages[1]["content"].split()[-1]) % 4
+        index = int(messages[1]["content"].split()[-1])
+        prefix = [1, 3, 4] + [3] * (index % 5)
+        length = 3 + index % 4
         return prefix if add_generation_prompt else prefix + [5] * length + [2]
 
     def decode(self, tokens, **kwargs):
@@ -38,6 +39,52 @@ def fsdp_worker(rank, directory, mode):
     dist.init_process_group("gloo", init_method=f"file://{root / 'rendezvous'}", rank=rank,
                             world_size=2, timeout=timedelta(seconds=60))
     try:
+        if mode == "gradient":
+            import copy
+            from peft import LoraConfig, get_peft_model
+            from transformers import Qwen2Config, Qwen2ForCausalLM
+            from baseline.model import ChunkedLoss, TARGETS, configure_attention
+            from baseline.parallel import shard_model
+            from baseline.data import collate_batch
+            torch.manual_seed(42)
+            configure_attention()
+            base = Qwen2ForCausalLM(Qwen2Config(vocab_size=16, hidden_size=16,
+                intermediate_size=24, num_hidden_layers=4, num_attention_heads=2,
+                num_key_value_heads=1, use_cache=False)).half().requires_grad_(False)
+            for name, parameter in base.named_parameters():
+                if 'norm' in name:
+                    parameter.data = parameter.data.float()
+            model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, target_modules=TARGETS,
+                                                  task_type='CAUSAL_LM'))
+            reference = ChunkedLoss(copy.deepcopy(model), 2)
+            root_module = shard_model(model, init_device_mesh('cpu', (2,)), torch.device('cpu'))
+            learner = ChunkedLoss(model, 2)
+            def batch(step, owner):
+                features = []
+                for i in range(4):
+                    count = 6 + (step * 3 + owner * 7 + i) % 11
+                    features.append({'input_ids': [1, 3, 4] + [5] * count,
+                                     'attention_mask': [1] * (3 + count),
+                                     'labels': [-100] * 3 + [5] * count})
+                return collate_batch(features, 0)
+            for step in range(4):
+                root_module.set_requires_gradient_sync(step == 3)
+                with torch.autocast('cpu', dtype=torch.float16):
+                    loss = learner(**batch(step, rank))
+                (loss / 4).backward()
+                for owner in range(2):
+                    with torch.autocast('cpu', dtype=torch.float16):
+                        loss = reference(**batch(step, owner))
+                    (loss / 8).backward()
+            expected = dict(reference.model.named_parameters())
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    key = name.replace('._checkpoint_wrapped_module', '')
+                    actual = parameter.grad.full_tensor()
+                    torch.testing.assert_close(actual, expected[key].grad, rtol=.02, atol=2e-5)
+                    if 'lora_B' in name:
+                        assert actual.abs().sum() > 0
+            return
         if mode == "scaler":
             mesh = init_device_mesh("cpu", (2,))
             layer = torch.nn.Linear(4, 2, bias=False)
@@ -146,6 +193,8 @@ class ParallelTests(unittest.TestCase):
             worker_cfg = json.loads(Path(command[command.index('--config') + 1]).read_text())
             self.assertEqual(worker_cfg, cfg)
             self.assertEqual(kwargs['env']['PYTHONHASHSEED'], '42')
+            self.assertGreater(int(kwargs['env']['TORCH_NCCL_TRACE_BUFFER_SIZE']), 0)
+            self.assertEqual(kwargs['env']['TORCH_NCCL_DUMP_ON_TIMEOUT'], '1')
             self.assertTrue(kwargs['check'])
         with patch('baseline.parallel.torch.cuda.device_count', return_value=2), \
              patch('baseline.parallel.subprocess.run', side_effect=inspect_launch) as runner:
@@ -183,7 +232,39 @@ class ParallelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(fsdp_worker, args=(directory, 'scaler'), nprocs=2, join=True)
 
+    def test_checkpointed_fsdp_gradients_match_unsharded_reference(self):
+        import torch.multiprocessing as mp
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(fsdp_worker, args=(directory, 'gradient'), nprocs=2, join=True)
+
+    def test_length_grouped_batches_reduce_padding_and_keep_partial_batch_last(self):
+        from baseline.parallel import parallel_batches
+        features = [{'input_ids': list(range(2 + (i * 71) % 509)), 'id': i} for i in range(133)]
+        def sample(grouped, epoch):
+            seen, padded, count = [], 0, []
+            for rank in range(2):
+                batches = list(parallel_batches(features, 4, 2, rank, 42, epoch, grouped))
+                count.append(len(batches))
+                for step, (batch, valid) in enumerate(batches):
+                    if step < len(batches) - 1:
+                        self.assertEqual(valid, 4)
+                    seen.extend(row['id'] for row in batch[:valid])
+                    padded += max(len(row['input_ids']) for row in batch) * valid
+            self.assertEqual(sorted(seen), list(range(133)))
+            self.assertEqual(count[0], count[1])
+            return seen, padded
+        grouped, padded = sample(True, 1)
+        self.assertEqual((grouped, padded), sample(True, 1))
+        self.assertNotEqual(grouped, sample(True, 2)[0])
+        self.assertLess(padded, sample(False, 1)[1] * .8)
+
     def test_two_rank_five_epochs_and_full_data_retrain(self):
+        self.run_search_and_retrain(batch_size=1)
+
+    def test_two_rank_batch_four_variable_lengths_and_partial_batches(self):
+        self.run_search_and_retrain(batch_size=4)
+
+    def run_search_and_retrain(self, batch_size):
         import torch.multiprocessing as mp
         import torch
         from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -193,7 +274,7 @@ class ParallelTests(unittest.TestCase):
             root = Path(directory)
             torch.manual_seed(42)
             Qwen2ForCausalLM(Qwen2Config(vocab_size=16, hidden_size=16, intermediate_size=24,
-                num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+                num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=1,
                 max_position_embeddings=128, use_cache=False)).save_pretrained(root / 'backbone')
             with (root / 'train_dataset.csv').open('w', newline='', encoding='utf-8') as handle:
                 writer = csv.DictWriter(handle, fieldnames=['id', 'question', 'cot', 'answer', 'unit'])
@@ -203,7 +284,7 @@ class ParallelTests(unittest.TestCase):
             cfg = json.loads(Path('configs/baseline.json').read_text())
             cfg.update(model_id=str(root / 'backbone'), revision='local-test', data_root=str(root),
                        output_dir=str(root / 'search'), max_length=32, lora_rank=2, lora_alpha=4,
-                       loss_chunk_size=2, batch_size=1, max_new_tokens=2, timeout_seconds=600, training_stage='search')
+                       loss_chunk_size=2, batch_size=batch_size, max_new_tokens=2, timeout_seconds=600, training_stage='search')
             splits, info = load_data(cfg, splits=('train',))
             fit, val = split_training_rows(splits['train'])
             split_path = root / 'split.json'
@@ -215,12 +296,14 @@ class ParallelTests(unittest.TestCase):
             search = json.loads((root / 'search/run.json').read_text())
             final = json.loads((root / 'final/run.json').read_text())
             self.assertEqual((search['training_samples'], final['training_samples']), (11, 13))
-            self.assertEqual((search['effective_batch_size'], final['effective_batch_size']), (8, 8))
+            self.assertEqual((search['effective_batch_size'], final['effective_batch_size']), (8 * batch_size,) * 2)
             self.assertEqual((search['config']['epochs'], final['config']['epochs']), (5, 3))
             self.assertEqual(search['model']['parallelism'], 'FSDP2')
             self.assertEqual(search['model']['world_size'], 2)
             self.assertEqual(final['training_status'], 'complete')
-            self.assertEqual(final['successful_optimizer_steps'], 6)
+            self.assertEqual(final['successful_optimizer_steps'], 6 if batch_size == 1 else 3)
+            self.assertEqual(search['model']['activation_checkpointing'], 'inside FSDP; non-reentrant')
+            self.assertTrue(search['group_by_length'])
             self.assertIsNone(final['split'])
             self.assertEqual(set(final['data']), {'train'})
             self.assertEqual(len(json.loads((root / 'search/train_log.json').read_text())), 5)

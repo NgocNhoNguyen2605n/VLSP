@@ -17,11 +17,13 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
+from safetensors.torch import load_file, save_file
 
 from .data import apply_training_split, collate_batch, encode_sample, load_data
 from .model import ChunkedLoss, load_model, load_tokenizer
@@ -47,6 +49,8 @@ def launch_training(config_path=None, cfg=None):
         env.update(PYTHONHASHSEED=str(cfg["seed"]))
         env.setdefault("OMP_NUM_THREADS", "1")
         env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+        env.setdefault("TORCH_NCCL_TRACE_BUFFER_SIZE", "2000")
+        env.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
         subprocess.run(command, cwd=Path(__file__).resolve().parents[1], env=env, check=True)
 
 
@@ -64,10 +68,22 @@ def primary_action(action):
     return payload[0].get("value")
 
 
-def parallel_batches(features, batch_size, world_size, rank, seed, epoch):
+def parallel_batches(features, batch_size, world_size, rank, seed, epoch, group_by_length=False):
     """Không lặp/bỏ mẫu: rank thiếu mẫu cuối chạy dummy với trọng số loss bằng 0."""
-    indices = torch.randperm(len(features), generator=torch.Generator().manual_seed(seed + epoch)).tolist()
+    generator = torch.Generator().manual_seed(seed + epoch)
+    indices = torch.randperm(len(features), generator=generator).tolist()
     width = batch_size * world_size
+    if group_by_length:
+        # Pool ngẫu nhiên, sort theo độ dài rồi shuffle các global batch.
+        # Batch thiếu luôn ở cuối để group_samples và gradient accumulation chia đúng.
+        complete = len(indices) // width * width
+        batches = []
+        for start in range(0, complete, width * 16):
+            pool = sorted(indices[start:min(start + width * 16, complete)],
+                          key=lambda index: len(features[index]["input_ids"]))
+            batches.extend(pool[offset:offset + width] for offset in range(0, len(pool), width))
+        order = torch.randperm(len(batches), generator=generator).tolist()
+        indices = [index for batch in order for index in batches[batch]] + indices[complete:]
     for offset in range(0, len(indices), width):
         selected = indices[offset + rank * batch_size:offset + (rank + 1) * batch_size]
         valid = len(selected)
@@ -75,18 +91,29 @@ def parallel_batches(features, batch_size, world_size, rank, seed, epoch):
 
 
 def shard_model(model, mesh, device):
-    """Shard từng decoder rồi Qwen2Model; head frozen được giữ đầy đủ cho chunked loss."""
+    """Checkpoint bên trong FSDP; lịch backward cố định trên cả hai rank."""
     base = model.get_base_model()
     if base.config.tie_word_embeddings:
         raise ValueError("FSDP pipeline yêu cầu embedding/head không dùng chung trọng số như Qwen2.5-Math.")
     policy = MixedPrecisionPolicy(reduce_dtype=torch.float32, cast_forward_inputs=False)
-    for layer in base.model.layers:
+    base.gradient_checkpointing_disable()
+    for index, layer in enumerate(base.model.layers):
         layer.to(device)
-        fully_shard(layer, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
+        wrapped = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+        base.model.layers[index] = wrapped
+        fully_shard(wrapped, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
+    # Embedding frozen không cần gather lại trong backward; root chỉ còn norm nhỏ.
+    base.model.embed_tokens.to(device)
+    fully_shard(base.model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
+    base.model.embed_tokens.set_unshard_in_backward(False)
     for name, module in base.model.named_children():
-        if name != "layers":
+        if name not in ("layers", "embed_tokens"):
             module.to(device)
-    fully_shard(base.model, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
+    fully_shard(base.model, mesh=mesh, reshard_after_forward=False, mp_policy=policy)
+    # Không suy lịch prefetch từ post-forward/recompute của graph từng rank.
+    base.model.set_modules_to_backward_prefetch([base.model.layers[-1]])
+    for index, layer in enumerate(base.model.layers):
+        layer.set_modules_to_backward_prefetch([base.model.layers[index - 1] if index else base.model])
     # Head không có gradient và được gọi nhiều lần theo số assistant token mỗi rank.
     # Replicate head tránh collective không khớp khi số chunk giữa các rank khác nhau.
     base.lm_head.to(device)
@@ -146,7 +173,14 @@ def save_adapter(model, tokenizer, directory, include_tokenizer=False):
             if dist.get_rank() == 0:
                 state[name] = full.detach().cpu().clone()
     def write():
-        model.save_pretrained(directory, state_dict=state)
+        # PEFT lọc theo named_modules (có wrapper); chỉ bỏ prefix sau khi export.
+        model.save_pretrained(directory, state_dict=state, save_embedding_layers=False)
+        path = Path(directory) / "adapter_model.safetensors"
+        exported = load_file(str(path))
+        if len(exported) != len(state):
+            raise RuntimeError("Export adapter thiếu tham số LoRA.")
+        save_file({name.replace("._checkpoint_wrapped_module", ""): tensor
+                   for name, tensor in exported.items()}, str(path), metadata={"format": "pt"})
         if include_tokenizer:
             tokenizer.save_pretrained(directory)
     primary_action(write)
@@ -185,6 +219,8 @@ def train_parallel(cfg, device):
             model, plan = load_model(cfg, training=True, cpu_init=True)
             head_size = model.get_output_embeddings().weight.numel()
             plan.update(parallelism="FSDP2", world_size=world, replicated_frozen_head=True,
+                        activation_checkpointing="inside FSDP; non-reentrant",
+                        backward_prefetch="explicit reverse decoder order",
                         fp16_weight_gib_per_gpu=[((plan["base_parameters"] - head_size) / world + head_size) * 2 / 2**30] * world)
             if device.type == "cuda":
                 free = torch.cuda.mem_get_info(device)[0] / 2**30
@@ -208,6 +244,7 @@ def train_parallel(cfg, device):
                 "template_sha256": hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
                 "effective_batch_size": width * accumulation, "training_stage": stage,
                 "training_samples": len(rows), "split": split,
+                "group_by_length": cfg.get("group_by_length", False),
                 "initialization": "backbone gốc và LoRA mới; không nạp checkpoint search",
                 "selection": "validation answer+unit accuracy" if validation else "final epoch",
                 "training_status": "running"}
@@ -221,9 +258,11 @@ def train_parallel(cfg, device):
             learner.train()
             optimizer.zero_grad(set_to_none=True)
             totals = torch.zeros(2, dtype=torch.float64, device=device)
+            epoch_start = time.monotonic()
             last_report = time.monotonic()
             for index, (selected, valid_samples) in enumerate(parallel_batches(
-                    features, cfg["batch_size"], world, rank, cfg["seed"], epoch)):
+                    features, cfg["batch_size"], world, rank, cfg["seed"], epoch,
+                    group_by_length=cfg.get("group_by_length", False))):
                 batch = {key: value.to(device) for key, value in collate_batch(
                     selected, tokenizer.pad_token_id).items()}
                 group_start = index // accumulation * accumulation
@@ -259,13 +298,15 @@ def train_parallel(cfg, device):
                                 or index + 1 == micro_steps):
                     print(f"Epoch {epoch}/{cfg['epochs']} | mẫu {min((index + 1) * width, len(rows))}/{len(rows)} | "
                           f"Train step {successful + skipped_steps}/{total_steps} | "
-                          f"cập nhật={successful} | bỏ={skipped_steps}", flush=True)
+                          f"cập nhật={successful} | bỏ={skipped_steps} | "
+                          f"{min((index + 1) * width, len(rows)) / (now - epoch_start):.2f} mẫu/s", flush=True)
                     last_report = now
             root.set_requires_gradient_sync(True)
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
             if not successful:
                 raise FloatingPointError("Chưa có bước cập nhật thành công; không lưu adapter.")
             record = {"epoch": epoch, "loss": (totals[0] / totals[1]).item(),
+                      "training_seconds": time.monotonic() - epoch_start,
                       "successful_optimizer_steps": successful, "skipped_optimizer_steps": skipped_steps,
                       "grad_scale": scaler.scale}
             checkpoint = output / f"epoch-{epoch}"
@@ -302,9 +343,10 @@ def main():
         raise RuntimeError("Worker FSDP phải được khởi chạy bằng torchrun trên GPU CUDA.")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", timeout=timedelta(minutes=30))
+    device = torch.device("cuda", local_rank)
+    dist.init_process_group("nccl", device_id=device, timeout=timedelta(minutes=5))
     try:
-        train_parallel(cfg, torch.device("cuda", local_rank))
+        train_parallel(cfg, device)
     finally:
         dist.destroy_process_group()
 

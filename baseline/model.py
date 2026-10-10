@@ -96,7 +96,10 @@ def load_model(cfg, training=False, adapter=None, cpu_init=False):
         for name, parameter in base.named_parameters():
             if "norm" in name:
                 parameter.data = parameter.data.float()
-        base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        # FSDP đặt activation checkpoint BÊN TRONG module được shard ở shard_model.
+        # Checkpoint của Transformers bọc cả __call__/hook FSDP và có thể all-gather lại khi recompute.
+        if not cpu_init:
+            base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         base.config.use_cache = False
         model = get_peft_model(base, LoraConfig(
             r=cfg["lora_rank"], lora_alpha=cfg["lora_alpha"],
