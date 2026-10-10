@@ -360,7 +360,8 @@ def train_parallel(cfg, device):
             totals = torch.zeros(2, dtype=torch.float64, device=device)
             epoch_start = time.monotonic()
             with BatchProgress(f"Epoch {epoch}/{cfg['epochs']}", micro_steps,
-                               enabled=primary, remaining_label="Còn epoch") as batch_progress:
+                               enabled=primary, remaining_label="Còn epoch",
+                               log_every=cfg.get("log_every", 10)) as batch_progress:
                 for index, (selected, valid_samples) in enumerate(parallel_batches(
                         features, cfg["batch_size"], world, rank, cfg["seed"], epoch,
                         group_by_length=cfg.get("group_by_length", False))):

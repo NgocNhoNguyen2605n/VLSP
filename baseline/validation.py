@@ -32,7 +32,8 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
     model = learner.model
     device = model.get_input_embeddings().weight.device
     total_loss, total_tokens = 0.0, 0
-    with torch.no_grad(), BatchProgress(f"Validation loss epoch {epoch}", len(loader), enabled=primary) as progress:
+    with torch.no_grad(), BatchProgress(f"Validation loss epoch {epoch}", len(loader), enabled=primary,
+                                       log_every=cfg.get("log_every", 10)) as progress:
         for index, batch in enumerate(loader, start=1):
             batch = {key: value.to(device) for key, value in batch.items()}
             with torch.autocast(device.type, dtype=torch.float16):
@@ -63,7 +64,8 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
         handle_context = ((result_dir / "predictions.jsonl").open("w", encoding="utf-8")
                           if primary else contextlib.nullcontext(None))
         # Hai rank phải cùng sinh đúng batch, kể cả batch cuối thiếu 4 câu.
-        with handle_context as handle, BatchProgress(f"Validation đáp án epoch {epoch}", math.ceil(len(rows) / batch_size), enabled=primary) as progress:
+        with handle_context as handle, BatchProgress(f"Validation đáp án epoch {epoch}", math.ceil(len(rows) / batch_size), enabled=primary,
+                                                     log_every=cfg.get("log_every", 10)) as progress:
             for index, start in enumerate(range(0, len(rows), batch_size), start=1):
                 batch_rows = rows[start:start + batch_size]
                 outputs = generate_batch(model, tokenizer, [row["question"] for row in batch_rows], cfg)

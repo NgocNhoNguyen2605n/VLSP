@@ -107,7 +107,8 @@ def train(cfg):
         optimizer.zero_grad(set_to_none=True)
         epoch_sum, epoch_tokens = 0.0, 0
         epoch_start = time.monotonic()
-        with BatchProgress(f"Epoch {epoch}/{cfg['epochs']}", len(loader), remaining_label="Còn epoch") as progress:
+        with BatchProgress(f"Epoch {epoch}/{cfg['epochs']}", len(loader), remaining_label="Còn epoch",
+                           log_every=cfg.get("log_every", 10)) as progress:
             for index, batch in enumerate(loader):
                 batch = {key: value.to(input_device) for key, value in batch.items()}
                 # Nhóm cuối ít mẫu hơn vẫn được chia đúng số micro-batch thực tế.
