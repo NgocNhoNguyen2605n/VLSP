@@ -104,7 +104,9 @@ def shard_model(model, mesh, device):
         layer.to(device)
         wrapped = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
         base.model.layers[index] = wrapped
-        fully_shard(wrapped, mesh=mesh, reshard_after_forward=True, mp_policy=policy, ignored_params=ignored)
+        # Chuyển device có thể thay Parameter object: lấy ignored_params SAU layer.to().
+        layer_adapters = {parameter for parameter in wrapped.parameters() if parameter.requires_grad}
+        fully_shard(wrapped, mesh=mesh, reshard_after_forward=True, mp_policy=policy, ignored_params=layer_adapters)
     # Embedding frozen không cần gather lại trong backward; root chỉ còn norm nhỏ.
     base.model.embed_tokens.to(device)
     fully_shard(base.model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
@@ -112,6 +114,7 @@ def shard_model(model, mesh, device):
     for name, module in base.model.named_children():
         if name not in ("layers", "embed_tokens"):
             module.to(device)
+    ignored = {parameter for parameter in model.parameters() if parameter.requires_grad}
     fully_shard(base.model, mesh=mesh, reshard_after_forward=False, mp_policy=policy, ignored_params=ignored)
     if any(isinstance(parameter, DTensor) for parameter in model.parameters() if parameter.requires_grad):
         raise RuntimeError("LoRA không được shard: pipeline chỉ đồng bộ gradient sau backward.")

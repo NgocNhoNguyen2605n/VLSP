@@ -106,7 +106,13 @@ def fsdp_worker(rank, directory, mode):
             model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, target_modules=TARGETS,
                                                   task_type='CAUSAL_LM'))
             reference = ChunkedLoss(copy.deepcopy(model), 2)
-            root_module = shard_model(model, init_device_mesh('cpu', (2,)), torch.device('cpu'))
+            # Ép .to() thay Parameter identity để kiểm tra ignored_params sau chuyển device.
+            old_overwrite = torch.__future__.get_overwrite_module_params_on_conversion()
+            torch.__future__.set_overwrite_module_params_on_conversion(True)
+            try:
+                shard_model(model, init_device_mesh('cpu', (2,)), torch.device('cpu'))
+            finally:
+                torch.__future__.set_overwrite_module_params_on_conversion(old_overwrite)
             learner = ChunkedLoss(model, 2)
             def batch(step, owner):
                 features = []
