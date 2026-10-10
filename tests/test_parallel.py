@@ -398,7 +398,8 @@ class ParallelTests(unittest.TestCase):
             cfg = json.loads(Path('configs/baseline.json').read_text())
             cfg.update(model_id=str(root / 'backbone'), revision='local-test', data_root=str(root),
                        output_dir=str(root / 'search'), max_length=32, lora_rank=2, lora_alpha=4,
-                       loss_chunk_size=2, batch_size=batch_size, max_new_tokens=2, timeout_seconds=600, training_stage='search')
+                       loss_chunk_size=2, batch_size=batch_size, gradient_accumulation_steps=4,
+                       max_new_tokens=2, timeout_seconds=600, training_stage='search')
             splits, info = load_data(cfg, splits=('train',))
             fit, val = split_training_rows(splits['train'])
             split_path = root / 'split.json'

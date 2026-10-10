@@ -53,6 +53,8 @@ def read_config(args):
 
 def print_training_config(cfg, target_modules, world_size=1):
     """In cấu hình của run hiện tại; worker distributed chỉ gọi từ rank 0."""
+    if not cfg.get("verbose_logging", False):
+        return
     stage = cfg.get("training_stage", "single")
     batch = cfg["batch_size"]
     accumulation = cfg["gradient_accumulation_steps"]

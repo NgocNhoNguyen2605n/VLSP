@@ -14,13 +14,13 @@ from .model import ChunkedLoss, TARGETS, configure_attention
 from .runtime import setup_seed
 
 
-def check_parallel_backend(device):
+def check_parallel_backend(device, verbose=False):
     """Batch 4, độ dài khác rank, tích lũy, gradient và optimizer phải khớp reference."""
     from .parallel import ParallelScaler, finish_device_work, shard_model, synchronize_adapter_gradients
     rank, world = dist.get_rank(), dist.get_world_size()
     if world != 2:
         raise ValueError("Preflight cần đúng hai worker.")
-    if rank == 0:
+    if rank == 0 and verbose:
         print(f"Preflight {dist.get_backend()}: kiểm tra FSDP backbone + LoRA all-reduce trên {world} {device.type}...", flush=True)
     setup_seed(42)
     configure_attention()
@@ -89,7 +89,8 @@ def check_parallel_backend(device):
     finish_device_work(device)
     dist.barrier()
     if rank == 0:
-        print(f"Preflight PASS: 3 optimizer steps, 12 micro-batches; gradient và optimizer khớp reference (sai lệch gradient tối đa {max_error:.2g}).", flush=True)
+        print((f"Preflight PASS: 3 optimizer steps, 12 micro-batches; gradient và optimizer khớp reference "
+               f"(sai lệch gradient tối đa {max_error:.2g}).") if verbose else "Preflight PASS", flush=True)
     result = {"status": "passed", "backend": dist.get_backend(), "device": str(device),
               "world_size": world, "max_gradient_error": max_error,
               "optimizer_steps": 3, "micro_batches": 12, "backward_prefetch": "disabled"}

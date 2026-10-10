@@ -28,6 +28,7 @@ from safetensors.torch import load_file, save_file
 from .data import apply_training_split, collate_batch, encode_sample, load_data
 from .model import TARGETS, ChunkedLoss, load_model, load_tokenizer
 from .validation import checkpoint_rank, validate_epoch
+from .progress import BatchProgress
 
 
 def launch_training(config_path=None, cfg=None):
@@ -248,6 +249,7 @@ def train_parallel(cfg, device):
     """Một search/final run trên nhóm distributed đã khởi tạo; CPU chỉ dùng cho test."""
     rank, world = dist.get_rank(), dist.get_world_size()
     primary = rank == 0
+    verbose = cfg.get("verbose_logging", False)
     if world != cfg["gpu_count"]:
         raise ValueError("Số worker khác gpu_count trong cấu hình.")
     setup_seed(cfg["seed"])
@@ -273,7 +275,10 @@ def train_parallel(cfg, device):
     # CPU init lần lượt tránh hai bản backbone đầy đủ cùng chiếm RAM Kaggle.
     for loading_rank in range(world):
         if rank == loading_rank:
-            print(f"Rank {rank}: nạp backbone từ CPU, shard FSDP sang {device}...", flush=True)
+            if verbose:
+                print(f"Rank {rank}: nạp backbone từ CPU, shard FSDP sang {device}...", flush=True)
+            elif primary:
+                print(f"Đang nạp {cfg['model_id']}...", flush=True)
             model, plan = load_model(cfg, training=True, cpu_init=True)
             head_size = model.get_output_embeddings().weight.numel()
             plan.update(parallelism="FSDP2", world_size=world, replicated_frozen_head=True,
@@ -302,7 +307,7 @@ def train_parallel(cfg, device):
     total_steps = math.ceil(micro_steps / accumulation) * cfg["epochs"]
     scheduler = get_cosine_schedule_with_warmup(optimizer,
         num_warmup_steps=math.ceil(total_steps * cfg["warmup_ratio"]), num_training_steps=total_steps)
-    if primary:
+    if primary and verbose:
         print(f"Model đã nạp: backbone={plan['base_parameters']:,} tham số | "
               f"LoRA trainable={plan['trainable_parameters']:,} | "
               f"backbone FP16/GPU={plan['fp16_weight_gib_per_gpu'][rank]:.2f} GiB | "
@@ -329,7 +334,7 @@ def train_parallel(cfg, device):
     mark("ready")
     successful, skipped_steps, consecutive_skips, history, best = 0, 0, 0, [], None
     try:
-        if primary:
+        if primary and verbose:
             print(f"FSDP {world} GPU | {len(rows)} train / {len(validation)} validation | "
                   f"{cfg['epochs']} epoch | batch_size={cfg['batch_size']}/GPU | "
                   f"{width} mẫu/batch | tích lũy={accumulation} batch | "
@@ -339,64 +344,54 @@ def train_parallel(cfg, device):
             optimizer.zero_grad(set_to_none=True)
             totals = torch.zeros(2, dtype=torch.float64, device=device)
             epoch_start = time.monotonic()
-            for index, (selected, valid_samples) in enumerate(parallel_batches(
-                    features, cfg["batch_size"], world, rank, cfg["seed"], epoch,
-                    group_by_length=cfg.get("group_by_length", False))):
-                batch_start = time.monotonic()
-                batch = {key: value.to(device) for key, value in collate_batch(
-                    selected, tokenizer.pad_token_id).items()}
-                mark("forward", epoch=epoch, batch=index + 1, total_batches=micro_steps,
-                     local_samples=valid_samples, input_shape=list(batch["input_ids"].shape))
-                group_start = index // accumulation * accumulation
-                group_samples = min(accumulation * width, len(rows) - group_start * width)
-                last = (index + 1) % accumulation == 0 or index + 1 == micro_steps
-                with torch.autocast(device.type, dtype=torch.float16):
-                    loss = learner(**batch)
-                finish_device_work(device)
-                tokens = int(batch["labels"][:, 1:].ne(-100).sum()) if valid_samples else 0
-                # Gộp kiểm tra finite và loss toàn batch trong cùng một collective.
-                batch_metrics = torch.stack((
-                    (~torch.isfinite(loss)).double(),
-                    loss.detach().double() * tokens,
-                    torch.tensor(tokens, dtype=torch.float64, device=device)))
-                dist.all_reduce(batch_metrics, op=dist.ReduceOp.SUM)
-                if batch_metrics[0].item():
-                    raise FloatingPointError(f"Loss không hữu hạn tại epoch {epoch}, micro-step {index + 1}.")
-                totals[0] += loss.detach().double() * tokens
-                totals[1] += tokens
-                # All-reduce lấy trung bình giữa rank; nhóm cuối chia theo số mẫu thật.
-                mark("backward")
-                (loss * (world * valid_samples / group_samples) * scaler.scale).backward()
-                finish_device_work(device)
-                if last:
-                    mark("gradient_sync")
-                    synchronize_adapter_gradients(params, device)
-                    mark("optimizer_step")
-                    skipped, old_scale, scale = scaler.step(params, optimizer, scheduler, cfg["max_grad_norm"], device)
-                    if skipped:
-                        skipped_steps += 1
-                        consecutive_skips += 1
-                        if primary:
-                            print(f"FP16 overflow: {old_scale:g} -> {scale:g}; bỏ bước trên cả {world} GPU.", flush=True)
-                        if consecutive_skips >= cfg.get("max_consecutive_skips", 8):
-                            raise FloatingPointError("Gradient không hữu hạn nhiều bước liên tiếp; dừng cả hai rank.")
-                    else:
-                        successful += 1
-                        consecutive_skips = 0
-                mark("batch_complete", successful_optimizer_steps=successful, skipped_optimizer_steps=skipped_steps)
-                if primary:
-                    batch_loss = (batch_metrics[1] / batch_metrics[2]).item()
-                    now = time.monotonic()
-                    processed = min((index + 1) * width, len(rows))
-                    rank_samples = [min(cfg["batch_size"], max(0, len(rows) - index * width - worker * cfg["batch_size"]))
-                                    for worker in range(world)]
-                    accumulation_size = min(accumulation, micro_steps - group_start)
-                    print(f"Epoch {epoch}/{cfg['epochs']} | Batch {index + 1}/{micro_steps} | "
-                          f"mẫu/GPU={rank_samples} | mẫu {processed}/{len(rows)} | "
-                          f"loss={batch_loss:.4f} | tích lũy={index - group_start + 1}/{accumulation_size} | "
-                          f"Optimizer step {successful + skipped_steps}/{total_steps} | "
-                          f"cập nhật={successful} | bỏ={skipped_steps} | "
-                          f"batch={now - batch_start:.2f}s | {processed / (now - epoch_start):.2f} mẫu/s", flush=True)
+            with BatchProgress(f"Epoch {epoch}/{cfg['epochs']}", micro_steps,
+                               enabled=primary, remaining_label="Còn epoch") as batch_progress:
+                for index, (selected, valid_samples) in enumerate(parallel_batches(
+                        features, cfg["batch_size"], world, rank, cfg["seed"], epoch,
+                        group_by_length=cfg.get("group_by_length", False))):
+                    batch = {key: value.to(device) for key, value in collate_batch(
+                        selected, tokenizer.pad_token_id).items()}
+                    mark("forward", epoch=epoch, batch=index + 1, total_batches=micro_steps,
+                         local_samples=valid_samples, input_shape=list(batch["input_ids"].shape))
+                    group_start = index // accumulation * accumulation
+                    group_samples = min(accumulation * width, len(rows) - group_start * width)
+                    last = (index + 1) % accumulation == 0 or index + 1 == micro_steps
+                    with torch.autocast(device.type, dtype=torch.float16):
+                        loss = learner(**batch)
+                    finish_device_work(device)
+                    tokens = int(batch["labels"][:, 1:].ne(-100).sum()) if valid_samples else 0
+                    # Gộp kiểm tra finite và loss toàn batch trong cùng một collective.
+                    batch_metrics = torch.stack((
+                        (~torch.isfinite(loss)).double(),
+                        loss.detach().double() * tokens,
+                        torch.tensor(tokens, dtype=torch.float64, device=device)))
+                    dist.all_reduce(batch_metrics, op=dist.ReduceOp.SUM)
+                    if batch_metrics[0].item():
+                        raise FloatingPointError(f"Loss không hữu hạn tại epoch {epoch}, micro-step {index + 1}.")
+                    totals[0] += loss.detach().double() * tokens
+                    totals[1] += tokens
+                    # All-reduce lấy trung bình giữa rank; nhóm cuối chia theo số mẫu thật.
+                    mark("backward")
+                    (loss * (world * valid_samples / group_samples) * scaler.scale).backward()
+                    finish_device_work(device)
+                    if last:
+                        mark("gradient_sync")
+                        synchronize_adapter_gradients(params, device)
+                        mark("optimizer_step")
+                        skipped, old_scale, scale = scaler.step(params, optimizer, scheduler, cfg["max_grad_norm"], device)
+                        if skipped:
+                            skipped_steps += 1
+                            consecutive_skips += 1
+                            if primary:
+                                batch_progress.close()
+                                print(f"FP16 overflow: {old_scale:g} -> {scale:g}; bỏ bước trên cả {world} GPU.", flush=True)
+                            if consecutive_skips >= cfg.get("max_consecutive_skips", 8):
+                                raise FloatingPointError("Gradient không hữu hạn nhiều bước liên tiếp; dừng cả hai rank.")
+                        else:
+                            successful += 1
+                            consecutive_skips = 0
+                    mark("batch_complete", successful_optimizer_steps=successful, skipped_optimizer_steps=skipped_steps)
+                    batch_progress.update(index + 1)
             finish_device_work(device)
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
             if not successful:
@@ -421,7 +416,7 @@ def train_parallel(cfg, device):
                     primary_action(lambda: save_json(output / "best_checkpoint.json", best))
             history.append(record)
             primary_action(lambda: save_json(output / "train_log.json", history))
-            if primary:
+            if primary and verbose:
                 print(f"Epoch {epoch} hoàn tất | loss={record['loss']:.4f}" +
                       (f" | đúng={result['content_tolerant']}/{result['total']} | best epoch={best['epoch']}" if validation else ""), flush=True)
         save_adapter(model, tokenizer, output / "adapter", include_tokenizer=True)
@@ -448,10 +443,11 @@ def main():
     try:
         if dist.get_rank() == 0:
             print_training_config(cfg, TARGETS, world_size=dist.get_world_size())
-            print("Thiết bị: " + " | ".join(
-                f"cuda:{i}={torch.cuda.get_device_name(i)}" for i in range(cfg["gpu_count"])), flush=True)
+            if cfg.get("verbose_logging", False):
+                print("Thiết bị: " + " | ".join(
+                    f"cuda:{i}={torch.cuda.get_device_name(i)}" for i in range(cfg["gpu_count"])), flush=True)
         from .parallel_check import check_parallel_backend
-        cfg["distributed_preflight"] = check_parallel_backend(device)
+        cfg["distributed_preflight"] = check_parallel_backend(device, verbose=cfg.get("verbose_logging", False))
         train_parallel(cfg, device)
     finally:
         dist.destroy_process_group()

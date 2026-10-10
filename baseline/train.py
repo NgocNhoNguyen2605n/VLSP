@@ -15,6 +15,7 @@ from transformers import get_cosine_schedule_with_warmup  # Learning rate giảm
 from .data import apply_training_split, collate_batch, encode_sample, load_data
 from .model import TARGETS, ChunkedLoss, diagnose_nonfinite, load_model, load_tokenizer  # Backbone và chẩn đoán.
 from .validation import checkpoint_rank, validate_epoch
+from .progress import BatchProgress
 
 
 def optimizer_step(params, optimizer, scaler, scheduler, max_norm):
@@ -62,12 +63,15 @@ def train(cfg):
     validation_loader = DataLoader(validation_features, batch_size=cfg["batch_size"], shuffle=False,
                                   num_workers=0, collate_fn=partial(
                                       collate_batch, pad_token_id=tokenizer.pad_token_id))
-    print(f"Dữ liệu: stage={stage}, train={len(features)}, validation={len(validation_rows)}; "
-          f"bỏ mẫu thiếu answer={data_info['train']['skipped_ids']}; seed={cfg['seed']}.", flush=True)
+    verbose = cfg.get("verbose_logging", False)
+    if verbose:
+        print(f"Dữ liệu: stage={stage}, train={len(features)}, validation={len(validation_rows)}; "
+              f"bỏ mẫu thiếu answer={data_info['train']['skipped_ids']}; seed={cfg['seed']}.", flush=True)
     print(f"Đang nạp {cfg['model_id']} FP16 và gắn LoRA...", flush=True)
     model, plan = load_model(cfg, training=True)
-    print(f"LoRA FP16: backbone={plan['base_parameters']:,}; "
-          f"tham số học={plan['trainable_parameters']:,}; GPU={cfg['gpu_count']}; seed={cfg['seed']}.", flush=True)
+    if verbose:
+        print(f"LoRA FP16: backbone={plan['base_parameters']:,}; "
+              f"tham số học={plan['trainable_parameters']:,}; GPU={cfg['gpu_count']}; seed={cfg['seed']}.", flush=True)
     if not plan["within_8b_backbone"]:
         print("Thử nghiệm nội bộ: backbone vượt giới hạn 8B của cuộc thi.", flush=True)
     params = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -78,9 +82,10 @@ def train(cfg):
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=math.ceil(total_steps * cfg["warmup_ratio"]),
         num_training_steps=total_steps)
-    print(f"Scheduler thực tế: warmup_steps={math.ceil(total_steps * cfg['warmup_ratio'])} | "
-          f"total_steps={total_steps} | AdamW betas={optimizer.defaults['betas']} | "
-          f"eps={optimizer.defaults['eps']:g}", flush=True)
+    if verbose:
+        print(f"Scheduler thực tế: warmup_steps={math.ceil(total_steps * cfg['warmup_ratio'])} | "
+              f"total_steps={total_steps} | AdamW betas={optimizer.defaults['betas']} | "
+              f"eps={optimizer.defaults['eps']:g}", flush=True)
     # Scale mặc định 65536 có thể gây nhiều overflow lúc đầu trên backbone FP16.
     input_device = model.get_input_embeddings().weight.device
     scaler = torch.amp.GradScaler(input_device.type, init_scale=cfg.get("fp16_init_scale", 128.0))
@@ -97,58 +102,49 @@ def train(cfg):
     updates, skipped_updates, history = 0, 0, []
     consecutive_skips, successful_updates = 0, 0
     max_skips = cfg.get("max_consecutive_skips", 8)
-    print(f"Bắt đầu train: {cfg['epochs']} epoch | {len(features)} mẫu/epoch | "
-          f"batch_size={cfg['batch_size']} | {len(loader)} batch/epoch | "
-          f"tích lũy={accumulation} batch | Optimizer step 0/{total_steps}.", flush=True)
     for epoch in range(1, cfg["epochs"] + 1):
         learner.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_sum, epoch_tokens = 0.0, 0
         epoch_start = time.monotonic()
-        for index, batch in enumerate(loader):
-            batch_start = time.monotonic()
-            batch = {key: value.to(input_device) for key, value in batch.items()}
-            # Nhóm cuối ít mẫu hơn vẫn được chia đúng số micro-batch thực tế.
-            group_start = index // accumulation * accumulation
-            group_size = min(accumulation, len(loader) - group_start)
-            with torch.autocast(input_device.type, dtype=torch.float16):
-                loss = learner(**batch)
-            if not torch.isfinite(loss):
-                detail = diagnose_nonfinite(learner, batch)
-                message = f"Loss không hữu hạn tại epoch {epoch}, batch {index + 1}. {detail}"
-                manifest.update(training_status="failed", failure=message)
-                save_json(output / "run.json", manifest)
-                raise FloatingPointError(message)
-            tokens = int(batch["labels"][:, 1:].ne(-100).sum())
-            epoch_sum += loss.detach().item() * tokens
-            epoch_tokens += tokens
-            scaler.scale(loss / group_size).backward()
-            if (index + 1) % accumulation == 0 or index + 1 == len(loader):
-                skipped, old_scale, scale = optimizer_step(
-                    params, optimizer, scaler, scheduler, cfg["max_grad_norm"])
-                if skipped:
-                    skipped_updates += 1
-                    consecutive_skips += 1
-                    print(f"FP16 overflow: scale {old_scale:g} -> {scale:g} | "
-                          f"bỏ {skipped_updates} bước | liên tiếp {consecutive_skips}/{max_skips}.", flush=True)
-                    if consecutive_skips >= max_skips:
-                        raise FloatingPointError(
-                            f"Gradient không hữu hạn {max_skips} bước liên tiếp dù scale đã giảm "
-                            f"còn {scale:g}; cần kiểm tra phép toán FP16, không tiếp tục chấm dev.")
-                else:
-                    successful_updates += 1
-                    consecutive_skips = 0
-                updates += 1
-            batch_loss = loss.detach().item()
-            now = time.monotonic()
-            processed = min((index + 1) * cfg["batch_size"], len(features))
-            print(f"Epoch {epoch}/{cfg['epochs']} | Batch {index + 1}/{len(loader)} | "
-                  f"mẫu/batch={batch['input_ids'].shape[0]} | mẫu {processed}/{len(features)} | "
-                  f"loss={batch_loss:.4f} | tích lũy={index - group_start + 1}/{group_size} | "
-                  f"Optimizer step {updates}/{total_steps} | cập nhật={successful_updates} | "
-                  f"bỏ={skipped_updates} | batch={now - batch_start:.2f}s | "
-                  f"{processed / (now - epoch_start):.2f} mẫu/s", flush=True)
+        with BatchProgress(f"Epoch {epoch}/{cfg['epochs']}", len(loader), remaining_label="Còn epoch") as progress:
+            for index, batch in enumerate(loader):
+                batch = {key: value.to(input_device) for key, value in batch.items()}
+                # Nhóm cuối ít mẫu hơn vẫn được chia đúng số micro-batch thực tế.
+                group_start = index // accumulation * accumulation
+                group_size = min(accumulation, len(loader) - group_start)
+                with torch.autocast(input_device.type, dtype=torch.float16):
+                    loss = learner(**batch)
+                if not torch.isfinite(loss):
+                    detail = diagnose_nonfinite(learner, batch)
+                    message = f"Loss không hữu hạn tại epoch {epoch}, batch {index + 1}. {detail}"
+                    manifest.update(training_status="failed", failure=message)
+                    save_json(output / "run.json", manifest)
+                    raise FloatingPointError(message)
+                tokens = int(batch["labels"][:, 1:].ne(-100).sum())
+                epoch_sum += loss.detach().item() * tokens
+                epoch_tokens += tokens
+                scaler.scale(loss / group_size).backward()
+                if (index + 1) % accumulation == 0 or index + 1 == len(loader):
+                    skipped, old_scale, scale = optimizer_step(
+                        params, optimizer, scaler, scheduler, cfg["max_grad_norm"])
+                    if skipped:
+                        skipped_updates += 1
+                        consecutive_skips += 1
+                        progress.close()
+                        print(f"FP16 overflow: scale {old_scale:g} -> {scale:g} | "
+                              f"bỏ {skipped_updates} bước | liên tiếp {consecutive_skips}/{max_skips}.", flush=True)
+                        if consecutive_skips >= max_skips:
+                            raise FloatingPointError(
+                                f"Gradient không hữu hạn {max_skips} bước liên tiếp dù scale đã giảm "
+                                f"còn {scale:g}; cần kiểm tra phép toán FP16, không tiếp tục chấm dev.")
+                    else:
+                        successful_updates += 1
+                        consecutive_skips = 0
+                    updates += 1
+                progress.update(index + 1)
         history.append({"epoch": epoch, "loss": epoch_sum / epoch_tokens,
+                        "training_seconds": time.monotonic() - epoch_start,
                         "skipped_optimizer_steps": skipped_updates,
                         "successful_optimizer_steps": successful_updates,
                         "grad_scale": scaler.get_scale()})
@@ -170,10 +166,12 @@ def train(cfg):
             if best is None or checkpoint_rank(result) > checkpoint_rank(best):
                 best = result.copy()
                 save_json(output / "best_checkpoint.json", best)
-            print(f"Epoch {epoch}: validation đúng={result['content_tolerant']}/{result['total']} | "
-                  f"loss={result['validation_loss']:.4f} | best epoch={best['epoch']}", flush=True)
+            if verbose:
+                print(f"Epoch {epoch}: validation đúng={result['content_tolerant']}/{result['total']} | "
+                      f"loss={result['validation_loss']:.4f} | best epoch={best['epoch']}", flush=True)
         save_json(output / "train_log.json", history)
-        print(f"Epoch {epoch}/{cfg['epochs']} hoàn tất | loss={history[-1]['loss']:.4f}", flush=True)
+        if verbose:
+            print(f"Epoch {epoch}/{cfg['epochs']} hoàn tất | loss={history[-1]['loss']:.4f}", flush=True)
     model.save_pretrained(output / "adapter")
     tokenizer.save_pretrained(output / "adapter")
     manifest.update(training_status="complete", successful_optimizer_steps=successful_updates,
