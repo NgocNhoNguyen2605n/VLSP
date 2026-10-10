@@ -16,8 +16,8 @@ Repo dùng để khảo sát dữ liệu và xây dựng baseline fine-tuning LL
 
 Baseline: `Qwen/Qwen2.5-Math-7B-Instruct`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Model/tokenizer/template được cố định tại revision `ef9926d75ab1d54532f6a30dd5e760355eb9aa4d`.
 
-- Train **5 epoch với seed 42**, chọn epoch có điểm validation cao nhất. Batch 1/GPU, tích lũy gradient 4/GPU trên 2 GPU (effective batch 8), LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
-- Backbone có **7.615.616.512 tham số**, dưới giới hạn 8B. Trọng số FP16 khoảng **14,19 GiB tổng**. Training dùng **FSDP2**, hai T4 xử lý các batch khác nhau đồng thời và chia trọng số theo shard. Head frozen được nhân bản để chunked loss không cần collective theo số token; riêng trọng số khoảng **7,60 GiB/GPU**, chưa gồm activation, adapter, optimizer và buffer giao tiếp. Micro-batch 1, gradient checkpointing và chunked loss giảm VRAM; vẫn cần đo VRAM thực tế trên Kaggle.
+- Train **5 epoch với seed 42**, chọn epoch có điểm validation cao nhất. Batch 4/GPU, tích lũy gradient 4/GPU trên 2 GPU (effective batch 32), LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
+- Backbone có **7.615.616.512 tham số**, dưới giới hạn 8B. Trọng số FP16 khoảng **14,19 GiB tổng**. Training dùng **FSDP2**, hai T4 xử lý các batch khác nhau đồng thời và chia trọng số theo shard. Head frozen được nhân bản để chunked loss không cần collective theo số token; riêng trọng số khoảng **7,60 GiB/GPU**, chưa gồm activation, adapter, optimizer và buffer giao tiếp. Micro-batch 4/GPU; gradient checkpointing và chunked loss giảm VRAM; vẫn cần đo VRAM thực tế trên Kaggle.
 - Dùng chat template Qwen2.5-Math chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Sinh greedy một lần mỗi câu; không dùng công cụ tính toán bên ngoài.
 - Model card chủ yếu hỗ trợ toán tiếng Anh/Trung. Khả năng giải vật lý tiếng Việt cần được đo trên dev; chưa có kết quả để khẳng định cải thiện so với backbone trước.
 
@@ -59,7 +59,7 @@ Run tìm epoch và run train cuối chạy **tuần tự** để giải phóng V
 - Overflow được đồng bộ: nếu một shard có NaN/Inf, cả hai rank cùng bỏ optimizer step, giảm loss scale và không tăng scheduler. Gradient clipping dùng norm toàn cục trên mọi shard.
 - Checkpoint chỉ gather các tham số LoRA về CPU; rank 0 ghi adapter/JSON. Không gather cả backbone 7B để lưu. Adapter cuối vẫn nạp bằng PEFT thông thường.
 - Validation cần mọi rank tham gia cùng câu hỏi vì FSDP có collective. Generation dùng `synced_gpus=True` để tránh kẹt khi EOS/deadline khác nhau; rank 0 ghi prediction và quyết định điểm. Validation không chia câu hỏi riêng cho từng GPU. Đánh giá dev sau cùng dùng model chia lớp trong một tiến trình như trước.
-- Seed/split/revision được cố định; giữ effective batch 8. `deterministic_algorithms(..., warn_only=True)` vẫn chỉ cảnh báo kernel không xác định. Không bảo đảm giống từng bit hoặc khớp kết quả của cách chạy chia lớp trước đây. FSDP có chi phí truyền trọng số, cần đo tốc độ thực tế trên T4; không mặc nhiên nhanh gấp đôi.
+- Seed/split/revision được cố định; effective batch hiện tại là 32. `deterministic_algorithms(..., warn_only=True)` vẫn chỉ cảnh báo kernel không xác định. Không bảo đảm giống từng bit hoặc khớp kết quả của cách chạy chia lớp trước đây. FSDP có chi phí truyền trọng số, cần đo tốc độ thực tế trên T4; không mặc nhiên nhanh gấp đôi.
 
 ## Đánh giá và độ ổn định
 
