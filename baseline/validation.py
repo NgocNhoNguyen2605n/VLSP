@@ -1,4 +1,4 @@
-"""Chấm validation nội bộ sau mỗi epoch; không dùng dev để chọn model."""
+"""Chấm dev sau mỗi epoch và chọn checkpoint theo đáp án + đơn vị."""
 
 import contextlib
 import json

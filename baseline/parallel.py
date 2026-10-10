@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig, get_cosine_schedule_with_warmup
 from safetensors.torch import load_file, save_file
 
-from .data import apply_training_split, collate_batch, encode_sample, load_data
+from .data import collate_batch, encode_sample, load_training_data
 from .model import TARGETS, ChunkedLoss, load_model, load_tokenizer
 from .validation import checkpoint_rank, validate_epoch
 from .progress import BatchProgress
@@ -274,10 +274,7 @@ def train_parallel(cfg, device):
     stage = cfg.get("training_stage", "single")
     if stage not in ("single", "search", "final"):
         raise ValueError("training_stage phải là single, search hoặc final.")
-    splits, info = load_data(cfg, splits=("train",) if stage != "single" else ("train", "dev"))
-    rows, validation, split = splits["train"], [], None
-    if stage == "search":
-        rows, validation, split = apply_training_split(rows, info["train"], cfg["split_file"])
+    rows, validation, info, split = load_training_data(cfg)
     tokenizer = load_tokenizer(cfg)
     features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in rows]
     validation_features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in validation]

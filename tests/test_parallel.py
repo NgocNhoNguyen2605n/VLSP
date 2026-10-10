@@ -1,4 +1,4 @@
-"""Hai tiến trình FSDP thật trên CPU: gradient, padding, overflow, checkpoint và retrain."""
+"""Hai tiến trình FSDP thật trên CPU: gradient, padding, overflow và train/dev."""
 
 import csv
 import json
@@ -274,10 +274,7 @@ def fsdp_worker(rank, directory, mode):
              patch("torch.distributed.reduce_scatter_tensor", side_effect=AssertionError('FSDP không được reduce-scatter LoRA')):
             train_parallel(cfg, torch.device('cpu'))
             best = json.loads((Path(cfg['output_dir']) / 'best_checkpoint.json').read_text())
-            final = {**cfg, 'training_stage': 'final', 'output_dir': str(root / 'final'), 'epochs': best['epoch']}
-            final.pop('split_file')
-            train_parallel(final, torch.device('cpu'))
-        assert initialized == ['search', 'final']
+        assert initialized == ['search']
         assert len(generated) == 5 * validation_count
         expected_batches = [min(4, validation_count - start) for start in range(0, validation_count, 4)]
         assert batch_sizes == expected_batches * 5
@@ -291,9 +288,9 @@ def fsdp_worker(rank, directory, mode):
         from safetensors.torch import load_file
         from peft import PeftModel
         from transformers import Qwen2ForCausalLM
-        saved = load_file(str(root / 'final/adapter/adapter_model.safetensors'))
+        saved = load_file(str(root / 'search/epoch-3/adapter_model.safetensors'))
         loaded = PeftModel.from_pretrained(Qwen2ForCausalLM.from_pretrained(root / 'backbone', dtype=torch.float16),
-                                          root / 'final/adapter')
+                                          root / 'search/epoch-3')
         for name, p in loaded.named_parameters():
             if 'lora_' in name:
                 key = name.replace('.default', '')
@@ -399,20 +396,20 @@ class ParallelTests(unittest.TestCase):
         self.assertNotEqual(grouped, sample(True, 2)[0])
         self.assertLess(padded, sample(False, 1)[1] * .8)
 
-    def test_two_rank_five_epochs_and_full_data_retrain(self):
-        self.run_search_and_retrain(batch_size=1)
+    def test_two_rank_five_epochs_full_train_and_dev_validation(self):
+        self.run_train_dev(batch_size=1)
 
     def test_two_rank_batch_four_variable_lengths_and_partial_batches(self):
-        self.run_search_and_retrain(batch_size=4)
+        self.run_train_dev(batch_size=4)
 
-    def test_tied_model_batch_four_search_validation_retrain_and_adapter_reload(self):
-        self.run_search_and_retrain(batch_size=4, tied=True)
+    def test_tied_model_batch_four_dev_validation_and_adapter_reload(self):
+        self.run_train_dev(batch_size=4, tied=True)
 
-    def run_search_and_retrain(self, batch_size, tied=False):
+    def run_train_dev(self, batch_size, tied=False):
         import torch.multiprocessing as mp
         import torch
         from transformers import Qwen2Config, Qwen2ForCausalLM
-        from baseline.data import load_data, split_training_rows
+        from baseline.data import load_data, validation_manifest
         from baseline.runtime import save_json
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -426,39 +423,45 @@ class ParallelTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows([{'id': str(i), 'question': f'Câu hỏi {i}', 'cot': 'Giải', 'answer': '1', 'unit': 'V'}
                                   for i in range(sample_count)])
+            validation_count = 5 if batch_size == 4 else 2
+            with (root / 'dev_dataset.csv').open('w', newline='', encoding='utf-8') as handle:
+                writer = csv.DictWriter(handle, fieldnames=['id', 'question', 'cot', 'answer', 'unit'])
+                writer.writeheader()
+                writer.writerows([{'id': str(i), 'question': f'Dev {i}', 'cot': 'Giải', 'answer': '1', 'unit': 'V'}
+                                  for i in range(validation_count)])
             cfg = json.loads(Path('configs/baseline.json').read_text())
             cfg.update(model_id=str(root / 'backbone'), revision='local-test', data_root=str(root),
                        output_dir=str(root / 'search'), max_length=32, lora_rank=2, lora_alpha=4,
                        loss_chunk_size=2, batch_size=batch_size, gradient_accumulation_steps=4,
                        max_new_tokens=2, timeout_seconds=600, training_stage='search')
-            splits, info = load_data(cfg, splits=('train',))
-            fit, val = split_training_rows(splits['train'])
+            splits, info = load_data(cfg)
             split_path = root / 'split.json'
-            save_json(split_path, {'train_csv_sha256': info['train']['sha256'],
-                'train_ids': [r['id'] for r in fit], 'validation_ids': [r['id'] for r in val]})
+            save_json(split_path, validation_manifest(splits, info))
             cfg['split_file'] = str(split_path)
             save_json(root / 'config.json', cfg)
             mp.spawn(fsdp_worker, args=(directory, 'training'), nprocs=2, join=True)
             search = json.loads((root / 'search/run.json').read_text())
-            final = json.loads((root / 'final/run.json').read_text())
-            self.assertEqual((search['training_samples'], final['training_samples']), (len(fit), sample_count))
-            self.assertEqual((search['effective_batch_size'], final['effective_batch_size']), (8 * batch_size,) * 2)
-            self.assertEqual((search['config']['epochs'], final['config']['epochs']), (5, 3))
+            self.assertEqual(search['training_samples'], sample_count)
+            self.assertEqual(search['effective_batch_size'], 8 * batch_size)
+            self.assertEqual(search['config']['epochs'], 5)
+            self.assertEqual(search['best_checkpoint']['epoch'], 3)
+            self.assertEqual(search['best_checkpoint']['total'], validation_count)
             self.assertEqual(search['model']['parallelism'], 'FSDP2')
             self.assertEqual(search['model']['world_size'], 2)
-            self.assertEqual(final['training_status'], 'complete')
+            self.assertEqual(search['training_status'], 'complete')
             import math
-            self.assertEqual(final['successful_optimizer_steps'], 3 * math.ceil(sample_count / (8 * batch_size)))
+            self.assertEqual(search['successful_optimizer_steps'], 5 * math.ceil(sample_count / (8 * batch_size)))
+            self.assertFalse((root / 'final').exists())
             self.assertEqual(search['model']['activation_checkpointing'], 'inside FSDP; non-reentrant')
             self.assertTrue(search['group_by_length'])
             self.assertTrue(search['model']['replicated_lora'])
             self.assertEqual(search['model']['replicated_frozen_embedding'], tied)
             for worker in range(2):
-                progress = json.loads((root / f'final/rank-{worker}-progress.json').read_text())
+                progress = json.loads((root / f'search/rank-{worker}-progress.json').read_text())
                 self.assertEqual(progress['phase'], 'complete')
-                self.assertEqual(progress['epoch'], 3)
-            self.assertIsNone(final['split'])
-            self.assertEqual(set(final['data']), {'train'})
+                self.assertEqual(progress['epoch'], 5)
+            self.assertEqual(search['split']['validation_source'], 'dev')
+            self.assertEqual(set(search['data']), {'train', 'dev'})
             self.assertEqual(len(json.loads((root / 'search/train_log.json').read_text())), 5)
             self.assertEqual(len(list((root / 'search/validation').glob('epoch-*/metrics.json'))), 5)
 

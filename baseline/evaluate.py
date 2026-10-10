@@ -84,13 +84,14 @@ def generate_batch(model, tokenizer, questions, cfg):
 def evaluate(run_dir, result_dir=None, data_root=None):
     """Chấm mọi dòng dev; báo riêng content đúng và đúng trong giới hạn thời gian."""
     run_dir = Path(run_dir)
-    if not (run_dir / "run.json").is_file() and (run_dir / "experiment.json").is_file():
+    if (run_dir / "experiment.json").is_file():
         experiment = json.loads((run_dir / "experiment.json").read_text(encoding="utf-8"))
         if experiment.get("status") != "complete":
-            raise RuntimeError("Experiment chưa hoàn tất; hãy retrain cấu hình đã chọn bằng "
-                               f"python -m baseline.experiment --retrain-from {run_dir} trước khi chấm dev.")
-        run_dir = run_dir / "final"
-        print(f"Evaluate adapter retrain cuối: {run_dir}", flush=True)
+            raise RuntimeError("Experiment chưa hoàn tất; cần train và chọn best checkpoint trước khi chấm dev.")
+        if experiment.get("workflow") != "train_dev":
+            run_dir = run_dir / "final"  # Đọc được kết quả workflow cũ đã hoàn tất.
+        else:
+            print(f"Evaluate best epoch {experiment['best_checkpoint']['epoch']}: {run_dir}", flush=True)
     if not (run_dir / "run.json").is_file():
         raise FileNotFoundError(f"{run_dir} thiếu run.json; --run-dir phải trùng --output-dir lúc train.")
     if not (run_dir / "adapter" / "adapter_config.json").is_file():
@@ -158,6 +159,8 @@ def evaluate(run_dir, result_dir=None, data_root=None):
                          "Tolerant: biểu thức số an toàn; không đổi thang đơn vị, không suy luận tương đương biểu thức có biến.",
                          "Không chấm chất lượng explanation; yêu cầu explanation không rỗng.",
                          "Mẫu quá thời gian bị tính sai; deadline chỉ dừng ở ranh giới token."]}
+    if (manifest.get("split") or {}).get("validation_source") == "dev":
+        summary["notes"].append("Dev đã dùng chọn checkpoint; điểm này là validation, không phải test độc lập.")
     save_json(result_dir / "metrics.json", summary)
     print(f"P1 ước lượng: {counts['p1_estimate']}/{counts['total']} | "
           f"content đúng={counts['content_tolerant']} | JSON hợp lệ={counts['valid_json']} | "

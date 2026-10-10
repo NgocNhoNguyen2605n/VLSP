@@ -2,12 +2,9 @@
 
 import csv  # Đọc CSV có dấu phẩy, BOM và xuống dòng trong ô.
 import json  # Đóng gói câu trả lời theo schema shared task.
-import math
-import random
 from pathlib import Path  # Tìm file trong các thư mục Input lồng nhau.
 
 from .runtime import fingerprint  # Hash dữ liệu gốc, không chỉnh sửa CSV.
-from .metrics import canonical_text
 
 COLUMNS = ("id", "question", "cot", "answer", "unit")
 SYSTEM = (
@@ -75,50 +72,27 @@ def load_data(cfg, splits=("train", "dev")):
     return rows_by_split, info
 
 
-def split_training_rows(rows, fraction=0.1, seed=42):
-    """Chia cố định theo nhóm câu hỏi; giữ câu trùng ở cùng phía."""
-    if not 0 < fraction < 1:
-        raise ValueError("validation_fraction phải nằm giữa 0 và 1.")
-    groups = {}
-    for row in rows:
-        groups.setdefault(canonical_text(row["question"]), []).append(row)
-    if len(groups) < 2:
-        raise ValueError("Cần ít nhất hai nhóm câu hỏi khác nhau để chia train/validation.")
-    groups = list(groups.values())
-    random.Random(seed).shuffle(groups)
-    target = min(len(rows) - 1, math.ceil(len(rows) * fraction))
-    # Subset-sum chọn số mẫu gần mục tiêu nhất mà không tách câu trùng.
-    reachable = {0: ()}
-    for index, group in enumerate(groups):
-        for size, selected in list(reachable.items()):
-            new_size = size + len(group)
-            if new_size < len(rows) and new_size not in reachable:
-                reachable[new_size] = selected + (index,)
-        if target in reachable:
-            break
-    size = min((n for n in reachable if n > 0), key=lambda n: (abs(n - target), n))
-    val_ids = {row["id"] for i in reachable[size] for row in groups[i]}
-    return ([row for row in rows if row["id"] not in val_ids],
-            [row for row in rows if row["id"] in val_ids])
+def validation_manifest(splits, info):
+    """Ghi nhận toàn bộ train và dev riêng biệt, không chia lại hay gộp dữ liệu."""
+    return {"validation_source": "dev", "train_csv_sha256": info["train"]["sha256"],
+            "dev_csv_sha256": info["dev"]["sha256"],
+            "train_ids": [row["id"] for row in splits["train"]],
+            "validation_ids": [row["id"] for row in splits["dev"]]}
 
 
-def apply_training_split(rows, info, path):
-    """Kiểm tra manifest split và trả hai tập, không đọc hay dùng dev."""
-    split = json.loads(Path(path).read_text(encoding="utf-8"))
-    if split["train_csv_sha256"] != info["sha256"]:
-        raise ValueError("CSV train đã đổi từ lúc tạo split.")
-    train_ids, val_ids = split["train_ids"], split["validation_ids"]
-    if (not train_ids or not val_ids or len(set(train_ids)) != len(train_ids)
-            or len(set(val_ids)) != len(val_ids) or set(train_ids) & set(val_ids)
-            or set(train_ids) | set(val_ids) != {row["id"] for row in rows}):
-        raise ValueError("Split không phải hai tập ID rời nhau bao phủ toàn bộ train hợp lệ.")
-    train_ids, val_ids = set(train_ids), set(val_ids)
-    training = [row for row in rows if row["id"] in train_ids]
-    validation = [row for row in rows if row["id"] in val_ids]
-    if ({canonical_text(row["question"]) for row in training}
-            & {canonical_text(row["question"]) for row in validation}):
-        raise ValueError("Câu hỏi trùng xuất hiện ở cả train và validation.")
-    return training, validation, split
+def load_training_data(cfg):
+    """Cả training thường và FSDP dùng cùng train đầy đủ / dev validation."""
+    # Stage final cũ vẫn chỉ nạp train; workflow hiện tại không tạo stage này.
+    if cfg.get("training_stage") == "final":
+        splits, info = load_data(cfg, splits=("train",))
+        return splits["train"], [], info, None
+    splits, info = load_data(cfg)
+    manifest = validation_manifest(splits, info)
+    if cfg.get("training_stage") == "search":
+        recorded = json.loads(Path(cfg["split_file"]).read_text(encoding="utf-8"))
+        if recorded != manifest:
+            raise ValueError("Train/dev CSV hoặc danh sách ID đã đổi từ lúc tạo manifest validation.")
+    return splits["train"], splits["dev"], info, manifest
 
 
 def prompt_messages(question):

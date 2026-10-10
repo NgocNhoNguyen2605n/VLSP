@@ -1,4 +1,4 @@
-"""Kiểm tra split, xếp hạng và luồng 5 epoch + train cuối bằng Qwen2 nhỏ trên CPU."""
+"""Kiểm tra train/dev, xếp hạng và xuất best epoch bằng Qwen2 nhỏ trên CPU."""
 
 import contextlib
 import csv
@@ -9,7 +9,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from baseline.data import apply_training_split, split_training_rows
 from baseline.validation import checkpoint_rank
 
 
@@ -18,38 +17,6 @@ class SplitTests(unittest.TestCase):
     def rows(count=100):
         return [{"id": str(i), "question": f"Câu hỏi {i}", "cot": "Giải", "answer": "1", "unit": "V"}
                 for i in range(count)]
-
-    def test_fixed_split_grouped_duplicates(self):
-        from baseline.metrics import canonical_text
-
-        rows = self.rows()
-        rows[1]["question"] = "  Câu hỏi  0\n"
-        training, validation = split_training_rows(rows)
-        self.assertEqual((len(training), len(validation)), (90, 10))
-        self.assertEqual((training, validation), split_training_rows(rows))
-        self.assertNotEqual(validation, split_training_rows(rows, seed=43)[1])
-        self.assertEqual({r["id"] for r in training + validation}, {r["id"] for r in rows})
-        self.assertFalse({canonical_text(r["question"]) for r in training}
-                         & {canonical_text(r["question"]) for r in validation})
-
-    def test_split_integrity_and_changed_data(self):
-        rows = self.rows(10)
-        training, validation = split_training_rows(rows)
-        split = {"train_csv_sha256": "hash", "train_ids": [r["id"] for r in training],
-                 "validation_ids": [r["id"] for r in validation]}
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "split.json"
-            path.write_text(json.dumps(split))
-            self.assertEqual(apply_training_split(rows, {"sha256": "hash"}, path)[:2], (training, validation))
-            with self.assertRaisesRegex(ValueError, "CSV train đã đổi"):
-                apply_training_split(rows, {"sha256": "changed"}, path)
-            split["validation_ids"].append(training[0]["id"])
-            path.write_text(json.dumps(split))
-            with self.assertRaisesRegex(ValueError, "rời nhau"):
-                apply_training_split(rows, {"sha256": "hash"}, path)
-        for rows in ([], self.rows(1)):
-            with self.assertRaises(ValueError):
-                split_training_rows(rows)
 
     def test_accuracy_ranking_and_ties(self):
         base = {"total": 10, "content_tolerant": 5, "content_exact": 4,
@@ -62,19 +29,49 @@ class SplitTests(unittest.TestCase):
 
 
 class ExperimentTests(unittest.TestCase):
-    def test_retrain_cli_uses_only_saved_experiment(self):
+    def test_worker_uses_all_train_and_only_dev_for_validation_and_checks_both_csvs(self):
+        from baseline.data import load_data, load_training_data, validation_manifest
+        from baseline.runtime import save_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = SplitTests.rows(10)
+            dev = [{**row, 'question': f"Dev {row['id']}"} for row in SplitTests.rows(3)]
+            for name, rows in (('train', train), ('dev', dev)):
+                with (root / f'{name}_dataset.csv').open('w', newline='', encoding='utf-8') as handle:
+                    writer = csv.DictWriter(handle, fieldnames=['id', 'question', 'cot', 'answer', 'unit'])
+                    writer.writeheader()
+                    writer.writerows(rows)
+            cfg = {'data_root': str(root), 'skip_missing_answer': True, 'training_stage': 'search',
+                   'split_file': str(root / 'split.json')}
+            splits, info = load_data(cfg)
+            manifest = validation_manifest(splits, info)
+            save_json(cfg['split_file'], manifest)
+            self.assertEqual(load_training_data(cfg)[:2], (train, dev))
+            # ID scopes belong to separate CSVs; equal IDs do not imply an internal split.
+            self.assertTrue(set(manifest['train_ids']) & set(manifest['validation_ids']))
+            for name in ('train', 'dev'):
+                dataset = root / f'{name}_dataset.csv'
+                original = dataset.read_bytes()
+                dataset.write_bytes(original + b'\n')
+                with self.assertRaisesRegex(ValueError, 'CSV hoặc danh sách ID đã đổi'):
+                    load_training_data(cfg)
+                dataset.write_bytes(original)
+            save_json(cfg['split_file'], {**manifest, 'validation_ids': ['wrong']})
+            with self.assertRaisesRegex(ValueError, 'CSV hoặc danh sách ID đã đổi'):
+                load_training_data(cfg)
+
+    def test_cli_runs_one_experiment_and_has_no_retrain_option(self):
         from baseline.experiment import main
-        with patch('sys.argv', ['baseline.experiment', '--retrain-from', '/chosen/run']), \
-             patch('baseline.experiment.run_retraining') as retrain, \
-             patch('baseline.experiment.read_config') as config:
+        cfg = json.loads(Path('configs/baseline.json').read_text())
+        with patch('sys.argv', ['baseline.experiment']), \
+             patch('baseline.experiment.read_config', return_value=cfg), \
+             patch('baseline.experiment.run_experiment') as run:
             main()
-            retrain.assert_called_once_with('/chosen/run')
-            config.assert_not_called()
-        with patch('sys.argv', ['baseline.experiment', '--retrain-from', '/chosen/run', '--config', 'other.json']), \
-             patch('baseline.experiment.run_retraining') as retrain, contextlib.redirect_stderr(io.StringIO()):
+            run.assert_called_once_with(cfg)
+        with patch('sys.argv', ['baseline.experiment', '--retrain-from', '/old/run']), \
+             contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 main()
-            retrain.assert_not_called()
 
     def test_legacy_train_cli_runs_experiment_and_internal_stages_do_not_recurse(self):
         from baseline.train import main
@@ -129,6 +126,36 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(result['content_tolerant'], 1)
             self.assertTrue((root / 'final/evaluation/metrics.json').is_file())
 
+    def test_evaluate_parent_uses_published_best_adapter_without_final_directory(self):
+        import hashlib
+        from baseline.evaluate import evaluate
+        from baseline.runtime import save_json
+        cfg = json.loads(Path('configs/baseline.json').read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_json(root / 'experiment.json', {'status': 'complete', 'workflow': 'train_dev',
+                                                'best_checkpoint': {'epoch': 3}})
+            save_json(root / 'adapter/adapter_config.json', {})
+            save_json(root / 'run.json', {'training_status': 'complete', 'config': cfg, 'data': {},
+                      'split': {'validation_source': 'dev'},
+                      'template_sha256': hashlib.sha256(b'toy-template').hexdigest()})
+            class Tokenizer:
+                chat_template = 'toy-template'
+            rows = SplitTests.rows(1)
+            with patch('baseline.evaluate.setup_seed'), patch('baseline.evaluate.environment', return_value={}), \
+                 patch('baseline.evaluate.load_data', return_value=({'train': rows, 'dev': rows}, {})), \
+                 patch('baseline.evaluate.load_tokenizer', return_value=Tokenizer()), \
+                 patch('baseline.evaluate.load_model', return_value=(object(), {})) as loader, \
+                 patch('baseline.evaluate.generate_once', return_value=(
+                     '{"answer":"1","unit":"V","explanation":"Giải"}', .1, 5, True)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result = evaluate(root)
+            loader.assert_called_once_with(cfg, adapter=root / 'adapter')
+            self.assertEqual(result['content_tolerant'], 1)
+            self.assertIn('không phải test độc lập', result['notes'][-1])
+            self.assertTrue((root / 'evaluation/metrics.json').is_file())
+            self.assertFalse((root / 'final').exists())
+
     def test_failed_search_does_not_start_final_training(self):
         from baseline.experiment import run_experiment
 
@@ -138,6 +165,7 @@ class ExperimentTests(unittest.TestCase):
                 writer = csv.DictWriter(handle, fieldnames=["id", "question", "cot", "answer", "unit"])
                 writer.writeheader()
                 writer.writerows(SplitTests.rows(10))
+            (root / "dev_dataset.csv").write_bytes((root / "train_dataset.csv").read_bytes())
             cfg = json.loads(Path("configs/baseline.json").read_text())
             cfg.update(data_root=str(root), output_dir=str(root / "experiment"))
             with contextlib.redirect_stdout(io.StringIO()), patch(
@@ -160,10 +188,10 @@ class ExperimentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "epochs"):
                 run_experiment({**cfg, "epochs": epochs})
 
-    def test_five_epochs_and_fresh_final_training(self):
+    def test_five_epochs_all_train_dev_validation_and_export_best_without_retrain(self):
         import torch
         from transformers import Qwen2Config, Qwen2ForCausalLM
-        from baseline.experiment import run_experiment, run_retraining
+        from baseline.experiment import run_experiment
         from baseline.model import backbone_plan, load_model
         from baseline.runtime import arguments, read_config
         from baseline.train import train
@@ -191,6 +219,11 @@ class ExperimentTests(unittest.TestCase):
                 writer = csv.DictWriter(handle, fieldnames=["id", "question", "cot", "answer", "unit"])
                 writer.writeheader()
                 writer.writerows(rows)
+            dev_rows = [{**row, "question": f"Dev {row['id']}"} for row in SplitTests.rows(3)]
+            with (root / "dev_dataset.csv").open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["id", "question", "cot", "answer", "unit"])
+                writer.writeheader()
+                writer.writerows(dev_rows)
             cfg = json.loads(Path("configs/baseline.json").read_text())
             cfg.update(model_id=str(root / "backbone"), revision="local-test", data_root=str(root),
                        output_dir=str(root / "experiment"), max_length=32, lora_rank=2, lora_alpha=4,
@@ -230,51 +263,36 @@ class ExperimentTests(unittest.TestCase):
                   contextlib.redirect_stdout(io.StringIO())):
                 # Trường cấu hình cũ không được kích hoạt thêm 5 run theo seed.
                 result = run_experiment({**cfg, "search_seeds": [42, 43, 44, 45, 46]}, runner=runner)
-                self.assertEqual(result["status"], "search_complete")
-                self.assertEqual(initialized, [("search", 42)])
-                self.assertFalse((root / "experiment/final").exists())
-                self.assertFalse((root / "experiment/configs/final.json").exists())
-                source_config = root / "experiment/experiment.json"
-                saved_config = source_config.read_bytes()
-                tampered = json.loads(saved_config)
-                tampered['config']['learning_rate'] = 0.5
-                source_config.write_text(json.dumps(tampered))
-                with self.assertRaisesRegex(ValueError, "Cấu hình đã lưu"):
-                    run_retraining(root / "experiment", runner=runner)
-                source_config.write_bytes(saved_config)
-                dataset = root / 'train_dataset.csv'
-                saved_data = dataset.read_bytes()
-                dataset.write_bytes(saved_data + b'\n')
-                with self.assertRaisesRegex(ValueError, "Train CSV đã đổi"):
-                    run_retraining(root / "experiment", runner=runner)
-                dataset.write_bytes(saved_data)
-                self.assertEqual(initialized, [("search", 42)])
-                # Thay đổi config hiện tại không được thay đổi cấu hình search đã chọn.
-                cfg["learning_rate"] = 0.5
-                result = run_retraining(root / "experiment", runner=runner)
-            self.assertEqual(result["status"], "complete")
+                self.assertEqual(result["status"], "complete")
+            self.assertEqual(initialized, [("search", 42)])  # One backbone load, no retrain.
+            self.assertFalse((root / "experiment/final").exists())
+            self.assertFalse((root / "experiment/configs/final.json").exists())
             self.assertEqual(result["completed_epochs"], [1, 2, 3, 4, 5])
-            self.assertEqual(initialized, [("search", 42), ("final", 42)])
-            self.assertEqual(len(calls), 15)  # 3 câu validation, chấm sau mỗi epoch.
+            self.assertEqual(calls, [row["question"] for row in dev_rows] * 5)
             self.assertNotIn("search_seeds", result["config"])
             self.assertEqual((result["best_checkpoint"]["seed"], result["best_checkpoint"]["epoch"]), (42, 3))
-            final = json.loads((root / "experiment/final/run.json").read_text())
-            self.assertEqual(final["training_samples"], 30)
-            self.assertEqual(final["config"]["epochs"], 3)
-            self.assertNotEqual(final["config"]["learning_rate"], cfg["learning_rate"])
-            self.assertEqual(len(json.loads((root / "experiment/final/train_log.json").read_text())), 3)
             search = json.loads((root / "experiment/search/run.json").read_text())
-            self.assertEqual(search["training_samples"], 27)
+            self.assertEqual(search["training_samples"], 30)  # All valid training rows.
             self.assertEqual(search["config"]["epochs"], 5)
-            self.assertIsNone(final["split"])
-            self.assertEqual(set(final["data"]), {"train"})  # Không cần dev CSV cho cả search/final.
-            self.assertTrue((root / "experiment/final/adapter/adapter_config.json").is_file())
-            selection = json.loads((root / "experiment/selection.json").read_text())
-            self.assertEqual(len(selection["candidates"]), 5)
+            self.assertEqual(set(search["data"]), {"train", "dev"})
+            self.assertEqual(len(search["split"]["train_ids"]), 30)
+            self.assertEqual(len(search["split"]["validation_ids"]), 3)
+            published = root / "experiment/adapter"
+            self.assertTrue((published / "adapter_config.json").is_file())
+            self.assertTrue((published / "tokenizer_config.json").is_file())
+            from safetensors.torch import load_file
+            best_weights = load_file(str(root / "experiment/search/epoch-3/adapter_model.safetensors"))
+            exported = load_file(str(published / "adapter_model.safetensors"))
+            last_weights = load_file(str(root / "experiment/search/epoch-5/adapter_model.safetensors"))
+            self.assertEqual(set(exported), set(best_weights))
+            for name in best_weights:
+                torch.testing.assert_close(exported[name], best_weights[name], rtol=0, atol=0)
+            self.assertTrue(any(not torch.equal(exported[name], last_weights[name]) for name in exported))
+            published_manifest = json.loads((root / "experiment/run.json").read_text())
+            self.assertEqual(published_manifest["adapter_epoch"], 3)
+            self.assertEqual(len(json.loads((root / "experiment/selection.json").read_text())["candidates"]), 5)
             with self.assertRaises(FileExistsError):
                 run_experiment(cfg, runner=runner)
-            with self.assertRaisesRegex(RuntimeError, "chưa retrain"):
-                run_retraining(root / "experiment", runner=runner)
 
 
 if __name__ == "__main__":

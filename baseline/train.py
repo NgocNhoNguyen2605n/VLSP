@@ -1,4 +1,4 @@
-"""Fine-tune LoRA FP16; một run tìm checkpoint hoặc train cuối từ backbone gốc."""
+"""Fine-tune LoRA FP16 trên train đầy đủ, chấm checkpoint trên dev."""
 
 from .runtime import arguments, environment, print_training_config, read_config, save_json, setup_seed  # Cấu hình và seed.
 
@@ -12,7 +12,7 @@ import torch  # Huấn luyện, autocast FP16 và kiểm tra gradient.
 from torch.utils.data import DataLoader  # Shuffle có seed, không dùng worker ngẫu nhiên.
 from transformers import get_cosine_schedule_with_warmup  # Learning rate giảm theo lịch cố định.
 
-from .data import apply_training_split, collate_batch, encode_sample, load_data
+from .data import collate_batch, encode_sample, load_training_data
 from .model import TARGETS, ChunkedLoss, diagnose_nonfinite, load_model, load_tokenizer  # Backbone và chẩn đoán.
 from .validation import checkpoint_rank, validate_epoch
 from .progress import BatchProgress
@@ -36,7 +36,7 @@ def optimizer_step(params, optimizer, scaler, scheduler, max_norm):
 
 
 def train(cfg):
-    """Search chỉ dùng train nội bộ; final tạo adapter mới trên toàn bộ train."""
+    """Học toàn bộ train; dev chỉ dùng để chấm sau mỗi epoch."""
     print_training_config(cfg, TARGETS)
     setup_seed(cfg["seed"])
     output = Path(cfg["output_dir"])
@@ -45,18 +45,10 @@ def train(cfg):
     stage = cfg.get("training_stage", "single")
     if stage not in ("single", "search", "final"):
         raise ValueError("training_stage phải là single, search hoặc final.")
-    splits, data_info = load_data(cfg, splits=("train",) if stage != "single" else ("train", "dev"))
-    training_rows, validation_rows, split_info = splits["train"], [], None
-    if stage == "search":
-        training_rows, validation_rows, split_info = apply_training_split(
-            splits["train"], data_info["train"], cfg["split_file"])
+    training_rows, validation_rows, data_info, split_info = load_training_data(cfg)
     tokenizer = load_tokenizer(cfg)
     features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in training_rows]
     validation_features = [encode_sample(tokenizer, row, cfg["max_length"]) for row in validation_rows]
-    # Run single vẫn kiểm tra dev; search/final không đọc dev.
-    if "dev" in splits:
-        for row in splits["dev"]:
-            encode_sample(tokenizer, row, cfg["max_length"])
     loader = DataLoader(features, batch_size=cfg["batch_size"], shuffle=True,
                         generator=torch.Generator().manual_seed(cfg["seed"]), num_workers=0,
                         collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id))
@@ -187,7 +179,7 @@ def main():
     if "training_stage" not in cfg:
         # Notebook cũ gọi train trực tiếp vẫn phải chạy quy trình chọn best epoch.
         from .experiment import run_experiment
-        print("Train mặc định: chia 90/10 và chọn best epoch; retrain được gọi riêng sau khi chọn cấu hình.", flush=True)
+        print("Train mặc định: 100% train, validation trên dev; lưu best epoch, không retrain.", flush=True)
         run_experiment(cfg)
         return
     if cfg.get("parallel_training") == "fsdp":

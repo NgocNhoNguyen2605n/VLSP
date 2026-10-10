@@ -84,8 +84,8 @@ def print_training_config(cfg, target_modules, world_size=1):
         lines.append("FSDP: backward_prefetch=disabled | decoder all-gather on demand | LoRA FP32 all-reduce sau backward")
     if stage == "search":
         lines.extend([
-            f"Split: validation_fraction={cfg.get('validation_fraction', 0.1):g} | "
-            f"split_seed={cfg.get('split_seed', 42)} | chọn best epoch theo validation answer+unit accuracy",
+            "Dữ liệu: toàn bộ train_dataset.csv | validation=dev_dataset.csv | "
+            "chọn best epoch theo validation answer+unit accuracy | không retrain",
             f"Validation: greedy | generation batch={cfg.get('validation_batch_size', 4)} | max_new_tokens={cfg['max_new_tokens']} | "
             f"timeout_seconds={cfg['timeout_seconds']} | rtol={cfg['rtol']:g} | atol={cfg['atol']:g}",
         ])
