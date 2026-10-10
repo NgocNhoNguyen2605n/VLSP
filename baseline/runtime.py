@@ -61,7 +61,7 @@ def setup_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    # Một số phép toán DeltaNet trên CUDA chưa có bản xác định tuyệt đối.
+    # Báo kernel chưa hỗ trợ tính xác định thay vì ngắt lần chạy.
     torch.use_deterministic_algorithms(True, warn_only=True)
     logging.set_verbosity_error()
     logging.disable_progress_bar()

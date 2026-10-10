@@ -14,10 +14,18 @@ Repo dùng để khảo sát dữ liệu và xây dựng baseline fine-tuning LL
 
 ## Baseline LoRA trên Kaggle
 
-Baseline: `Qwen/Qwen3.5-4B`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Model/tokenizer/template được cố định tại revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
+Baseline: `Qwen/Qwen2.5-Math-7B-Instruct`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Model/tokenizer/template được cố định tại revision `ef9926d75ab1d54532f6a30dd5e760355eb9aa4d`.
 
-- Seed **42**, batch 1, tích lũy gradient 16, 3 epoch, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`. Lưu adapter sau mỗi epoch và dùng adapter cuối; không chọn checkpoint theo điểm dev.
-- Model card khuyến nghị sampling; baseline này chọn greedy để tạo mốc đánh giá dễ tái lập, chưa khẳng định cấu hình sinh cho điểm cao nhất.
+- Seed **42**, batch 1, tích lũy gradient 8 (effective batch 8), 3 epoch, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`. Lưu adapter sau mỗi epoch và dùng adapter cuối; không chọn checkpoint theo điểm dev.
+- Backbone có **7.615.616.512 tham số**, dưới giới hạn 8B. Trọng số FP16 khoảng **14,19 GiB tổng**, chia cố định trên hai T4; chưa gồm activation, adapter và optimizer. Micro-batch 1, gradient checkpointing và chunked loss giảm VRAM; vẫn cần đo VRAM thực tế trên Kaggle.
+- Dùng chat template Qwen2.5-Math chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Sinh greedy một lần mỗi câu; không dùng công cụ tính toán bên ngoài.
+- Model card chủ yếu hỗ trợ toán tiếng Anh/Trung. Khả năng giải vật lý tiếng Việt cần được đo trên dev; chưa có kết quả để khẳng định cải thiện so với backbone trước.
+
+Clone nhánh `Nhotest` trên Kaggle:
+
+```bash
+git clone --branch Nhotest --single-branch https://github.com/NgocNhoNguyen2605n/VLSP.git /kaggle/working/VLSP
+```
 
 Sau khi clone repo về chạy lần lượt:
 
@@ -30,7 +38,7 @@ Sau khi clone repo về chạy lần lượt:
 ```python
 !python -m baseline.check
 !python -m baseline.train
-!python -m baseline.evaluate --run-dir /kaggle/working/vipra_4b_seed42
+!python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen25_math_7b_seed42
 ```
 
 
@@ -64,4 +72,10 @@ evaluation/metrics.json      # Tổng số mẫu đúng và quy tắc chấm
 | `baseline/runtime.py` | Seed, cấu hình và manifest |
 
 
-Nguồn: [Qwen3.5-4B model card](https://huggingface.co/Qwen/Qwen3.5-4B), [Qwen3.5 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen3_5), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).
+Kiểm tra CPU (model Qwen2 nhỏ, không tải trọng số 7B):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Nguồn: [Qwen2.5-Math-7B-Instruct model card](https://huggingface.co/Qwen/Qwen2.5-Math-7B-Instruct), [Qwen2 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen2), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).

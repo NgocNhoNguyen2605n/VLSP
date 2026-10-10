@@ -155,42 +155,40 @@ class TrainingTests(unittest.TestCase):
 
 
 class NativeModelTests(unittest.TestCase):
-    """Model Qwen3.5 rất nhỏ để kiểm tra loss, gradient và mapping checkpoint."""
+    """Model Qwen2 rất nhỏ để kiểm tra loss, gradient và checkpoint."""
 
     @staticmethod
     def config(tied=False):
-        """Giữ cả DeltaNet/full attention nhưng dùng ít tham số để test CPU."""
-        from transformers import Qwen3_5TextConfig
+        """Kiến trúc Qwen2.5-Math thu nhỏ, chạy trên CPU."""
+        from transformers import Qwen2Config
 
-        return Qwen3_5TextConfig(
+        return Qwen2Config(
             vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
-            tie_word_embeddings=tied,
-            num_attention_heads=2, num_key_value_heads=1, head_dim=16,
-            layer_types=["linear_attention", "full_attention"], linear_num_key_heads=2,
-            linear_num_value_heads=2, linear_key_head_dim=8, linear_value_head_dim=8,
-            rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
-                             "partial_rotary_factor": 0.5, "mrope_section": [1, 1, 2],
-                             "mrope_interleaved": True}, use_cache=False)
+            tie_word_embeddings=tied, num_attention_heads=2, num_key_value_heads=1,
+            max_position_embeddings=128, use_cache=False)
 
     def test_loss_and_gradient(self):
         """Chunked loss phải bằng loss chuẩn và chỉ adapter nhận gradient."""
         import torch
         from peft import LoraConfig, get_peft_model
-        from transformers import Qwen3_5ForCausalLM
+        from transformers import Qwen2ForCausalLM
         from baseline.model import ChunkedLoss
 
         for tied in (False, True):
             with self.subTest(tied_embeddings=tied):
                 torch.manual_seed(42)
-                base = Qwen3_5ForCausalLM(self.config(tied))
+                base = Qwen2ForCausalLM(self.config(tied))
                 base.requires_grad_(False)
                 base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
                 model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, task_type="CAUSAL_LM",
-                                                      target_modules=["q_proj", "in_proj_qkv", "gate_proj"]))
-                ids = torch.randint(0, 64, (1, 12))
+                                                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                                                      "gate_proj", "up_proj", "down_proj"]))
+                ids = torch.randint(0, 64, (2, 12))
                 labels = ids.clone()
                 labels[:, :4] = -100
+                labels[1, 9:] = -100
                 mask = torch.ones_like(ids)
+                mask[1, 9:] = 0
                 expected = model(input_ids=ids, attention_mask=mask, labels=labels, use_cache=False).loss
                 learner = ChunkedLoss(model, 3)
                 actual = learner(ids, mask, labels)
@@ -201,41 +199,55 @@ class NativeModelTests(unittest.TestCase):
                 self.assertTrue(all(parameter.grad is None for name, parameter in model.named_parameters()
                                     if "lora_" not in name))
 
-    def test_multimodal_checkpoint_to_text(self):
-        """Nạp text backbone phải giữ đúng trọng số từ checkpoint multimodal."""
+    def test_checkpoint_and_backbone_plan(self):
+        """Đếm đúng tham số, chia đủ lớp và nạp checkpoint text không thiếu key."""
         import torch
-        from transformers import Qwen3_5Config, Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
+        from transformers import Qwen2ForCausalLM
+        from baseline.model import backbone_plan, layer_map
 
         for tied in (False, True):
             with self.subTest(tied_embeddings=tied):
-                full_config = Qwen3_5Config(
-                    text_config=self.config(tied).to_dict(), tie_word_embeddings=tied, vision_config={
-                        "depth": 1, "hidden_size": 32, "intermediate_size": 64, "num_heads": 4,
-                        "out_hidden_size": 32, "num_position_embeddings": 16, "patch_size": 2,
-                        "spatial_merge_size": 2, "temporal_patch_size": 1})
-                full = Qwen3_5ForConditionalGeneration(full_config)
+                config = self.config(tied)
+                model = Qwen2ForCausalLM(config)
+                mapping = layer_map(config, 2)
+                self.assertEqual(mapping["model.layers.0"], 0)
+                self.assertEqual(mapping["model.layers.1"], 1)
+                self.assertEqual(mapping["lm_head"], 0 if tied else 1)
+                self.assertEqual(mapping["model.norm"], mapping["lm_head"])
                 with tempfile.TemporaryDirectory() as directory:
-                    full.save_pretrained(directory)
-                    text, info = Qwen3_5ForCausalLM.from_pretrained(
-                        directory, config=full_config.text_config, output_loading_info=True)
-                    self.assertFalse(info["missing_keys"])
-                    for name, weight in full.model.language_model.state_dict().items():
-                        torch.testing.assert_close(text.model.state_dict()[name], weight)
+                    model.save_pretrained(directory)
+                    cfg = {"model_id": directory, "revision": "local-test",
+                           "gpu_count": 2, "internal_experiment": False}
+                    text_config, actual_map, plan = backbone_plan(cfg)
+                    self.assertEqual(actual_map, mapping)
+                    count = sum(p.numel() for p in model.parameters())
+                    self.assertEqual(plan["base_parameters"], count)
+                    self.assertAlmostEqual(sum(plan["fp16_weight_gib_per_gpu"]), count * 2 / 2**30)
+                    self.assertTrue(plan["within_8b_backbone"])
+                    restored, info = Qwen2ForCausalLM.from_pretrained(
+                        directory, config=text_config, output_loading_info=True)
+                    for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
+                        self.assertFalse(info.get(key))
+                    for name, weight in model.state_dict().items():
+                        torch.testing.assert_close(restored.state_dict()[name], weight)
+        with self.assertRaises(ValueError):
+            layer_map(self.config(), 3)
 
     def test_adapter_round_trip(self):
         """Adapter sau một optimizer step phải giữ dự đoán khi lưu/nạp lại."""
         import torch
         from peft import LoraConfig, PeftModel, get_peft_model
-        from transformers import Qwen3_5ForCausalLM
+        from transformers import Qwen2ForCausalLM
 
         for tied in (False, True):
             with self.subTest(tied_embeddings=tied):
                 torch.manual_seed(42)
-                base = Qwen3_5ForCausalLM(self.config(tied))
+                base = Qwen2ForCausalLM(self.config(tied))
                 original = {name: weight.detach().clone() for name, weight in base.state_dict().items()}
                 base.requires_grad_(False)
                 model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, task_type="CAUSAL_LM",
-                                                      target_modules=["q_proj", "in_proj_qkv", "gate_proj"]))
+                                                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                                                      "gate_proj", "up_proj", "down_proj"]))
                 ids = torch.randint(0, 64, (1, 12))
                 optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.001)
                 model(input_ids=ids, labels=ids, use_cache=False).loss.backward()
@@ -244,11 +256,51 @@ class NativeModelTests(unittest.TestCase):
                 expected = model(input_ids=ids, use_cache=False).logits.detach()
                 with tempfile.TemporaryDirectory() as directory:
                     model.save_pretrained(directory)
-                    restored_base = Qwen3_5ForCausalLM(self.config(tied))
+                    restored_base = Qwen2ForCausalLM(self.config(tied))
                     restored_base.load_state_dict(original)
                     restored = PeftModel.from_pretrained(restored_base, directory).eval()
                     actual = restored(input_ids=ids, use_cache=False).logits.detach()
                     torch.testing.assert_close(actual, expected)
+
+    def test_training_loader_fp16(self):
+        """Luồng load_model thật giữ backbone FP16 và chỉ học LoRA FP32."""
+        import torch
+        from unittest.mock import patch
+        from transformers import Qwen2ForCausalLM
+        from baseline.model import ChunkedLoss, backbone_plan, load_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            Qwen2ForCausalLM(self.config()).save_pretrained(directory)
+            cfg = {"model_id": directory, "revision": "local-test", "gpu_count": 2,
+                   "internal_experiment": False, "lora_rank": 2, "lora_alpha": 4,
+                   "lora_dropout": 0.0}
+
+            def cpu_plan(config):
+                text, mapping, plan = backbone_plan(config)
+                return text, {key: "cpu" for key in mapping}, plan
+
+            # Chỉ thay vị trí GPU bằng CPU, giữ nguyên nạp checkpoint và tạo LoRA.
+            with patch("baseline.model.require_gpus"), patch("baseline.model.backbone_plan", cpu_plan):
+                model, plan = load_model(cfg, training=True)
+            self.assertGreater(plan["trainable_parameters"], 0)
+            self.assertFalse(model.config.use_cache)
+            for name, parameter in model.named_parameters():
+                if "lora_" in name:
+                    self.assertTrue(parameter.requires_grad)
+                    self.assertEqual(parameter.dtype, torch.float32)
+                else:
+                    self.assertFalse(parameter.requires_grad)
+                    self.assertEqual(parameter.dtype, torch.float32 if "norm" in name else torch.float16)
+            ids = torch.randint(0, 64, (1, 12))
+            labels = ids.clone()
+            labels[:, :4] = -100
+            # Train dùng autocast FP16 khi norm/adapter ở FP32.
+            with torch.autocast("cpu", dtype=torch.float16):
+                loss = ChunkedLoss(model, 3)(ids, torch.ones_like(ids), labels)
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            gradients = [p.grad for p in model.parameters() if p.requires_grad]
+            self.assertTrue(all(g is not None and torch.isfinite(g).all() for g in gradients))
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,10 +4,9 @@ import torch  # Tensor, tự động tính gradient và đặt lớp lên GPU.
 import torch.nn.functional as F  # Cross-entropy cho dự đoán token tiếp theo.
 from peft import LoraConfig, PeftModel, get_peft_model  # Tạo/lưu/nạp adapter LoRA.
 from torch.utils.checkpoint import checkpoint  # Tính lại logits khi backward để giảm VRAM.
-from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM  # Model và template chính thức.
+from transformers import AutoConfig, AutoTokenizer, Qwen2ForCausalLM  # Model và template chính thức.
 
-TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z",
-           "in_proj_a", "in_proj_b", "out_proj", "gate_proj", "up_proj", "down_proj"]
+TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 def load_tokenizer(cfg):
@@ -35,13 +34,13 @@ def layer_map(text_config, gpu_count):
 def backbone_plan(cfg):
     """Tính tham số và VRAM trọng số trên meta device trước khi tải checkpoint."""
     config = AutoConfig.from_pretrained(cfg["model_id"], revision=cfg["revision"])
-    if config.model_type != "qwen3_5":
-        raise ValueError("Pipeline hiện dành cho Qwen3.5 dense.")
-    text = config.text_config
+    if config.model_type != "qwen2":
+        raise ValueError("Pipeline hiện dành cho Qwen2/Qwen2.5 dense.")
+    text = config
     mapping = layer_map(text, cfg["gpu_count"])
     sizes = [0] * cfg["gpu_count"]
     with torch.device("meta"):
-        skeleton = Qwen3_5ForCausalLM(text)
+        skeleton = Qwen2ForCausalLM(text)
     for name, parameter in skeleton.named_parameters():
         prefix = max((key for key in mapping if name == key or name.startswith(key + ".")), key=len)
         sizes[mapping[prefix]] += parameter.numel()
@@ -66,14 +65,13 @@ def require_gpus(cfg, plan):
 
 
 def load_model(cfg, training=False, adapter=None):
-    """Nạp phần ngôn ngữ FP16 và adapter; tower ảnh không phục vụ task văn bản."""
+    """Nạp Qwen2.5-Math FP16 và adapter LoRA cho task văn bản."""
     text, mapping, plan = backbone_plan(cfg)
     require_gpus(cfg, plan)
-    # Transformers có mapping chính thức từ model.language_model sang model.
-    base, info = Qwen3_5ForCausalLM.from_pretrained(
+    base, info = Qwen2ForCausalLM.from_pretrained(
         cfg["model_id"], revision=cfg["revision"], config=text, dtype=torch.float16,
         device_map=mapping, attn_implementation="eager", output_loading_info=True)
-    if info.get("missing_keys") or info.get("mismatched_keys") or info.get("error_msgs"):
+    if any(info.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise RuntimeError(f"Checkpoint không nạp đầy đủ: {info}")
     if training:
         base.requires_grad_(False)

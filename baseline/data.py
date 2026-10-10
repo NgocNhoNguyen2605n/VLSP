@@ -79,9 +79,9 @@ def prompt_messages(question):
 
 
 def prompt_ids(tokenizer, question):
-    """Dùng template chính thức, tắt thinking để khớp định dạng SFT."""
+    """Dùng template Qwen2.5-Math chính thức, khớp prefix assistant khi SFT."""
     return tokenizer.apply_chat_template(prompt_messages(question), tokenize=True,
-                                         add_generation_prompt=True, enable_thinking=False,
+                                         add_generation_prompt=True,
                                          return_dict=False)
 
 
@@ -93,7 +93,7 @@ def encode_sample(tokenizer, row, max_length):
         {"role": "assistant", "content": json.dumps(target, ensure_ascii=False)}]
     prefix = prompt_ids(tokenizer, row["question"])
     full = tokenizer.apply_chat_template(messages, tokenize=True,
-                                         add_generation_prompt=False, enable_thinking=False,
+                                         add_generation_prompt=False,
                                          return_dict=False)
     if full[:len(prefix)] != prefix:
         raise ValueError(f"{row['id']}: template train và inference không khớp.")
