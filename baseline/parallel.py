@@ -253,16 +253,18 @@ def train_parallel(cfg, device):
     try:
         if primary:
             print(f"FSDP {world} GPU | {len(rows)} train / {len(validation)} validation | "
-                  f"{cfg['epochs']} epoch | effective batch={width * accumulation}", flush=True)
+                  f"{cfg['epochs']} epoch | batch_size={cfg['batch_size']}/GPU | "
+                  f"{width} mẫu/batch | tích lũy={accumulation} batch | "
+                  f"effective batch={width * accumulation}", flush=True)
         for epoch in range(1, cfg["epochs"] + 1):
             learner.train()
             optimizer.zero_grad(set_to_none=True)
             totals = torch.zeros(2, dtype=torch.float64, device=device)
             epoch_start = time.monotonic()
-            last_report = time.monotonic()
             for index, (selected, valid_samples) in enumerate(parallel_batches(
                     features, cfg["batch_size"], world, rank, cfg["seed"], epoch,
                     group_by_length=cfg.get("group_by_length", False))):
+                batch_start = time.monotonic()
                 batch = {key: value.to(device) for key, value in collate_batch(
                     selected, tokenizer.pad_token_id).items()}
                 group_start = index // accumulation * accumulation
@@ -271,11 +273,15 @@ def train_parallel(cfg, device):
                 root.set_requires_gradient_sync(last)
                 with torch.autocast(device.type, dtype=torch.float16):
                     loss = learner(**batch)
-                failed = (~torch.isfinite(loss)).to(dtype=torch.int32)
-                dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-                if failed.item():
-                    raise FloatingPointError(f"Loss không hữu hạn tại epoch {epoch}, micro-step {index + 1}.")
                 tokens = int(batch["labels"][:, 1:].ne(-100).sum()) if valid_samples else 0
+                # Gộp kiểm tra finite và loss toàn batch trong cùng một collective.
+                batch_metrics = torch.stack((
+                    (~torch.isfinite(loss)).double(),
+                    loss.detach().double() * tokens,
+                    torch.tensor(tokens, dtype=torch.float64, device=device)))
+                dist.all_reduce(batch_metrics, op=dist.ReduceOp.SUM)
+                if batch_metrics[0].item():
+                    raise FloatingPointError(f"Loss không hữu hạn tại epoch {epoch}, micro-step {index + 1}.")
                 totals[0] += loss.detach().double() * tokens
                 totals[1] += tokens
                 # FSDP lấy trung bình gradient giữa rank; nhân world để nhóm cuối vẫn chia đúng số mẫu thật.
@@ -292,15 +298,19 @@ def train_parallel(cfg, device):
                     else:
                         successful += 1
                         consecutive_skips = 0
-                now = time.monotonic()
-                if primary and (index == 0 or now - last_report >= 60
-                                or last and ((successful + skipped_steps) % cfg["log_every"] == 0)
-                                or index + 1 == micro_steps):
-                    print(f"Epoch {epoch}/{cfg['epochs']} | mẫu {min((index + 1) * width, len(rows))}/{len(rows)} | "
-                          f"Train step {successful + skipped_steps}/{total_steps} | "
+                if primary:
+                    batch_loss = (batch_metrics[1] / batch_metrics[2]).item()
+                    now = time.monotonic()
+                    processed = min((index + 1) * width, len(rows))
+                    rank_samples = [min(cfg["batch_size"], max(0, len(rows) - index * width - worker * cfg["batch_size"]))
+                                    for worker in range(world)]
+                    accumulation_size = min(accumulation, micro_steps - group_start)
+                    print(f"Epoch {epoch}/{cfg['epochs']} | Batch {index + 1}/{micro_steps} | "
+                          f"mẫu/GPU={rank_samples} | mẫu {processed}/{len(rows)} | "
+                          f"loss={batch_loss:.4f} | tích lũy={index - group_start + 1}/{accumulation_size} | "
+                          f"Optimizer step {successful + skipped_steps}/{total_steps} | "
                           f"cập nhật={successful} | bỏ={skipped_steps} | "
-                          f"{min((index + 1) * width, len(rows)) / (now - epoch_start):.2f} mẫu/s", flush=True)
-                    last_report = now
+                          f"batch={now - batch_start:.2f}s | {processed / (now - epoch_start):.2f} mẫu/s", flush=True)
             root.set_requires_gradient_sync(True)
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
             if not successful:

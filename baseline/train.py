@@ -93,14 +93,16 @@ def train(cfg):
     updates, skipped_updates, history = 0, 0, []
     consecutive_skips, successful_updates = 0, 0
     max_skips = cfg.get("max_consecutive_skips", 8)
-    last_report, reported_updates = time.monotonic(), 0
     print(f"Bắt đầu train: {cfg['epochs']} epoch | {len(features)} mẫu/epoch | "
-          f"Train step 0/{total_steps}.", flush=True)
+          f"batch_size={cfg['batch_size']} | {len(loader)} batch/epoch | "
+          f"tích lũy={accumulation} batch | Optimizer step 0/{total_steps}.", flush=True)
     for epoch in range(1, cfg["epochs"] + 1):
         learner.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_sum, epoch_tokens = 0.0, 0
+        epoch_start = time.monotonic()
         for index, batch in enumerate(loader):
+            batch_start = time.monotonic()
             batch = {key: value.to(input_device) for key, value in batch.items()}
             # Nhóm cuối ít mẫu hơn vẫn được chia đúng số micro-batch thực tế.
             group_start = index // accumulation * accumulation
@@ -133,15 +135,15 @@ def train(cfg):
                     successful_updates += 1
                     consecutive_skips = 0
                 updates += 1
-            # Log khi xong batch đầu/cuối, sau 60 giây hoặc đủ số bước đã cấu hình.
+            batch_loss = loss.detach().item()
             now = time.monotonic()
-            if (index == 0 or index + 1 == len(loader) or now - last_report >= 60
-                    or updates - reported_updates >= cfg["log_every"]):
-                processed = min((index + 1) * cfg["batch_size"], len(features))
-                print(f"Epoch {epoch}/{cfg['epochs']} | mẫu {processed}/{len(features)} | "
-                      f"Train step {updates}/{total_steps} | cập nhật={successful_updates} | "
-                      f"bỏ={skipped_updates} | loss={epoch_sum / epoch_tokens:.4f}", flush=True)
-                last_report, reported_updates = now, updates
+            processed = min((index + 1) * cfg["batch_size"], len(features))
+            print(f"Epoch {epoch}/{cfg['epochs']} | Batch {index + 1}/{len(loader)} | "
+                  f"mẫu/batch={batch['input_ids'].shape[0]} | mẫu {processed}/{len(features)} | "
+                  f"loss={batch_loss:.4f} | tích lũy={index - group_start + 1}/{group_size} | "
+                  f"Optimizer step {updates}/{total_steps} | cập nhật={successful_updates} | "
+                  f"bỏ={skipped_updates} | batch={now - batch_start:.2f}s | "
+                  f"{processed / (now - epoch_start):.2f} mẫu/s", flush=True)
         history.append({"epoch": epoch, "loss": epoch_sum / epoch_tokens,
                         "skipped_optimizer_steps": skipped_updates,
                         "successful_optimizer_steps": successful_updates,
