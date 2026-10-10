@@ -128,7 +128,7 @@ def prompt_messages(question):
 
 
 def prompt_ids(tokenizer, question):
-    """Dùng template Qwen2.5-Math chính thức, khớp prefix assistant khi SFT."""
+    """Dùng template chính thức của backbone, khớp prefix assistant khi SFT."""
     return tokenizer.apply_chat_template(prompt_messages(question), tokenize=True,
                                          add_generation_prompt=True,
                                          return_dict=False)

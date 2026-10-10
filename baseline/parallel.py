@@ -22,7 +22,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
+from transformers import AutoConfig, get_cosine_schedule_with_warmup
 from safetensors.torch import load_file, save_file
 
 from .data import apply_training_split, collate_batch, encode_sample, load_data
@@ -94,8 +94,10 @@ def parallel_batches(features, batch_size, world_size, rank, seed, epoch, group_
 def shard_model(model, mesh, device):
     """Checkpoint bên trong FSDP; decoder chỉ all-gather khi backward cần lớp đó."""
     base = model.get_base_model()
-    if base.config.tie_word_embeddings:
-        raise ValueError("FSDP pipeline yêu cầu embedding/head không dùng chung trọng số như Qwen2.5-Math.")
+    tied = base.config.tie_word_embeddings
+    if tied and (base.lm_head.weight is not base.model.embed_tokens.weight
+                 or base.lm_head.weight.requires_grad):
+        raise ValueError("Embedding/head phải dùng chung một trọng số frozen khi tie_word_embeddings=true.")
     policy = MixedPrecisionPolicy(reduce_dtype=torch.float32, cast_forward_inputs=False)
     ignored = {parameter for parameter in model.parameters() if parameter.requires_grad}
     if not ignored or any(parameter.dtype != torch.float32 for parameter in ignored):
@@ -108,14 +110,21 @@ def shard_model(model, mesh, device):
         # Chuyển device có thể thay Parameter object: lấy ignored_params SAU layer.to().
         layer_adapters = {parameter for parameter in wrapped.parameters() if parameter.requires_grad}
         fully_shard(wrapped, mesh=mesh, reshard_after_forward=True, mp_policy=policy, ignored_params=layer_adapters)
-    # Embedding frozen không cần gather lại trong backward; root chỉ còn norm nhỏ.
+    # Tied embedding/head giữ một tensor frozen replicate; head có số chunk khác mỗi rank.
+    # Lấy lại Parameter SAU .to() và gắn head vào đúng tensor đã chuyển device.
     base.model.embed_tokens.to(device)
-    fully_shard(base.model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=policy)
+    if tied:
+        base.lm_head.weight = base.model.embed_tokens.weight
+    embedding_ignored = {base.model.embed_tokens.weight} if tied else None
+    fully_shard(base.model.embed_tokens, mesh=mesh, reshard_after_forward=True,
+                mp_policy=policy, ignored_params=embedding_ignored)
     base.model.embed_tokens.set_unshard_in_backward(False)
     for name, module in base.model.named_children():
         if name not in ("layers", "embed_tokens"):
             module.to(device)
     ignored = {parameter for parameter in model.parameters() if parameter.requires_grad}
+    if tied:
+        ignored.add(base.model.embed_tokens.weight)
     fully_shard(base.model, mesh=mesh, reshard_after_forward=False, mp_policy=policy, ignored_params=ignored)
     if any(isinstance(parameter, DTensor) for parameter in model.parameters() if parameter.requires_grad):
         raise RuntimeError("LoRA không được shard: pipeline chỉ đồng bộ gradient sau backward.")
@@ -129,7 +138,11 @@ def shard_model(model, mesh, device):
         module.set_modules_to_backward_prefetch([base.model.embed_tokens])
     # Head không có gradient và được gọi nhiều lần theo số assistant token mỗi rank.
     # Replicate head tránh collective không khớp khi số chunk giữa các rank khác nhau.
-    base.lm_head.to(device)
+    if not tied:
+        base.lm_head.to(device)
+    elif (base.lm_head.weight is not base.model.embed_tokens.weight
+          or isinstance(base.lm_head.weight, DTensor)):
+        raise RuntimeError("FSDP không được shard hoặc tách trọng số embedding/head dùng chung.")
     return base.model
 
 
@@ -224,7 +237,7 @@ class ParallelScaler:
 
 
 def save_adapter(model, tokenizer, directory, include_tokenizer=False):
-    """Gather chỉ LoRA lên CPU, không gather toàn bộ backbone 7B để lưu."""
+    """Gather chỉ LoRA lên CPU, không gather toàn bộ backbone để lưu."""
     state = {}
     for name, parameter in model.named_parameters():
         if parameter.requires_grad:
@@ -282,6 +295,8 @@ def train_parallel(cfg, device):
             model, plan = load_model(cfg, training=True, cpu_init=True)
             head_size = model.get_output_embeddings().weight.numel()
             plan.update(parallelism="FSDP2", world_size=world, replicated_frozen_head=True,
+                        tied_word_embeddings=bool(model.config.tie_word_embeddings),
+                        replicated_frozen_embedding=bool(model.config.tie_word_embeddings),
                         replicated_lora=True, gradient_sync="FP32 bucket all-reduce after backward; no FSDP reduce-scatter",
                         activation_checkpointing="inside FSDP; non-reentrant",
                         backward_prefetch="disabled via frozen embedding no-op target; decoder all-gather on demand",
@@ -447,7 +462,10 @@ def main():
                 print("Thiết bị: " + " | ".join(
                     f"cuda:{i}={torch.cuda.get_device_name(i)}" for i in range(cfg["gpu_count"])), flush=True)
         from .parallel_check import check_parallel_backend
-        cfg["distributed_preflight"] = check_parallel_backend(device, verbose=cfg.get("verbose_logging", False))
+        text_config = AutoConfig.from_pretrained(cfg["model_id"], revision=cfg["revision"])
+        cfg["distributed_preflight"] = check_parallel_backend(
+            device, verbose=cfg.get("verbose_logging", False),
+            tied_embeddings=text_config.tie_word_embeddings)
         train_parallel(cfg, device)
     finally:
         dist.destroy_process_group()

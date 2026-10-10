@@ -217,7 +217,10 @@ class ExperimentTests(unittest.TestCase):
                         for question in questions]
 
             def runner(path):
-                train(read_config(arguments("test").parse_args(["--config", str(path)])))
+                worker_cfg = read_config(arguments("test").parse_args(["--config", str(path)]))
+                # Như worker CUDA: metadata được thêm sau khi đọc cấu hình search.
+                worker_cfg['distributed_preflight'] = {'status': 'passed', 'device': 'cuda:0'}
+                train(worker_cfg)
 
             with (patch("baseline.model.require_gpus"),
                   patch("baseline.model.backbone_plan", cpu_plan),

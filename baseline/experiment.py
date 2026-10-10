@@ -121,7 +121,10 @@ def run_retraining(experiment_dir, runner=None):
         raise RuntimeError("Search chưa hoàn tất hoặc không khớp dữ liệu.")
     expected_config = {**cfg, "output_dir": str(output / "search"), "training_stage": "search",
                        "split_file": str(output / "split.json")}
-    if (search["config"] != expected_config
+    # Worker thêm kết quả preflight theo rank/device, không phải hyperparameter của search.
+    recorded_config = search["config"].copy()
+    recorded_config.pop("distributed_preflight", None)
+    if (recorded_config != expected_config
             or json.loads((output / "configs" / "search.json").read_text(encoding="utf-8")) != expected_config):
         raise ValueError("Cấu hình đã lưu không khớp cấu hình thực tế của search.")
     for epoch, (record, candidate) in enumerate(zip(history, selection["candidates"]), start=1):

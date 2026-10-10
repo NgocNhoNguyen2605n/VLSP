@@ -1,4 +1,4 @@
-"""Kiểm tra backend thật bằng Qwen nhỏ trước khi nạp backbone 7B."""
+"""Kiểm tra backend thật bằng Qwen nhỏ trước khi nạp backbone."""
 
 import copy
 import gc
@@ -14,7 +14,7 @@ from .model import ChunkedLoss, TARGETS, configure_attention
 from .runtime import setup_seed
 
 
-def check_parallel_backend(device, verbose=False):
+def check_parallel_backend(device, verbose=False, tied_embeddings=False):
     """Batch 4, độ dài khác rank, tích lũy, gradient và optimizer phải khớp reference."""
     from .parallel import ParallelScaler, finish_device_work, shard_model, synchronize_adapter_gradients
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -26,7 +26,8 @@ def check_parallel_backend(device, verbose=False):
     configure_attention()
     base = Qwen2ForCausalLM(Qwen2Config(vocab_size=64, hidden_size=64, intermediate_size=128,
         num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-        max_position_embeddings=128, use_cache=False)).half().requires_grad_(False)
+        max_position_embeddings=128, use_cache=False,
+        tie_word_embeddings=tied_embeddings)).half().requires_grad_(False)
     for name, parameter in base.named_parameters():
         if "norm" in name:
             parameter.data = parameter.data.float()
@@ -93,7 +94,8 @@ def check_parallel_backend(device, verbose=False):
                f"(sai lệch gradient tối đa {max_error:.2g}).") if verbose else "Preflight PASS", flush=True)
     result = {"status": "passed", "backend": dist.get_backend(), "device": str(device),
               "world_size": world, "max_gradient_error": max_error,
-              "optimizer_steps": 3, "micro_batches": 12, "backward_prefetch": "disabled"}
+              "optimizer_steps": 3, "micro_batches": 12, "backward_prefetch": "disabled",
+              "tied_word_embeddings": tied_embeddings}
     del learner, model, base, reference, expected, expected_optimizer, params, optimizer, scheduler, parameter
     gc.collect()
     if device.type == "cuda":

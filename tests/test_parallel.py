@@ -39,12 +39,13 @@ def fsdp_worker(rank, directory, mode):
     dist.init_process_group("gloo", init_method=f"file://{root / 'rendezvous'}", rank=rank,
                             world_size=2, timeout=timedelta(seconds=60))
     try:
-        if mode == 'preflight':
+        if mode in ('preflight', 'preflight_tied'):
             from baseline.parallel_check import check_parallel_backend
             torch.set_num_threads(1)
             with patch('torch.distributed.reduce_scatter_tensor', side_effect=AssertionError('reduce-scatter bị cấm')):
-                result = check_parallel_backend(torch.device('cpu'))
+                result = check_parallel_backend(torch.device('cpu'), tied_embeddings=mode == 'preflight_tied')
             assert result['status'] == 'passed' and result['backend'] == 'gloo'
+            assert result['tied_word_embeddings'] == (mode == 'preflight_tied')
             return
         if mode == 'replicated':
             weight = torch.nn.Parameter(torch.ones(4))
@@ -88,7 +89,7 @@ def fsdp_worker(rank, directory, mode):
             synchronize_adapter_gradients(list(layer.parameters()), torch.device('cpu'))
             torch.testing.assert_close(layer.weight.grad, reference.weight.grad)
             return
-        if mode == "gradient":
+        if mode in ("gradient", "gradient_tied"):
             import copy
             from peft import LoraConfig, get_peft_model
             from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -100,7 +101,8 @@ def fsdp_worker(rank, directory, mode):
             configure_attention()
             base = Qwen2ForCausalLM(Qwen2Config(vocab_size=16, hidden_size=16,
                 intermediate_size=24, num_hidden_layers=4, num_attention_heads=2,
-                num_key_value_heads=1, use_cache=False)).half().requires_grad_(False)
+                num_key_value_heads=1, use_cache=False,
+                tie_word_embeddings=mode == 'gradient_tied')).half().requires_grad_(False)
             for name, parameter in base.named_parameters():
                 if 'norm' in name:
                     parameter.data = parameter.data.float()
@@ -114,6 +116,11 @@ def fsdp_worker(rank, directory, mode):
                 shard_model(model, init_device_mesh('cpu', (2,)), torch.device('cpu'))
             finally:
                 torch.__future__.set_overwrite_module_params_on_conversion(old_overwrite)
+            if mode == 'gradient_tied':
+                assert base.lm_head.weight is base.model.embed_tokens.weight
+                assert not isinstance(base.lm_head.weight, torch.distributed.tensor.DTensor)
+                assert not base.lm_head.weight.requires_grad
+                shared_weight = base.lm_head.weight.detach().clone()
             learner = ChunkedLoss(model, 2)
             def batch(step, owner):
                 features = []
@@ -180,6 +187,9 @@ def fsdp_worker(rank, directory, mode):
                                 assert parameter.grad.abs().sum() > 0
                     optimizer.step()
                     reference_optimizer.step()
+                    if mode == 'gradient_tied':
+                        assert base.lm_head.weight is base.model.embed_tokens.weight
+                        torch.testing.assert_close(base.lm_head.weight, shared_weight)
                     for name, parameter in model.named_parameters():
                         if parameter.requires_grad:
                             key = name.replace('._checkpoint_wrapped_module', '')
@@ -348,6 +358,11 @@ class ParallelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(fsdp_worker, args=(directory, 'gradient'), nprocs=2, join=True)
 
+    def test_tied_embedding_head_fsdp_gradients_and_frozen_shared_weight(self):
+        import torch.multiprocessing as mp
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(fsdp_worker, args=(directory, 'gradient_tied'), nprocs=2, join=True)
+
     def test_replicated_gradients_missing_parameters_clipping_overflow_and_partial_batch(self):
         import torch.multiprocessing as mp
         with tempfile.TemporaryDirectory() as directory:
@@ -357,6 +372,11 @@ class ParallelTests(unittest.TestCase):
         import torch.multiprocessing as mp
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(fsdp_worker, args=(directory, 'preflight'), nprocs=2, join=True)
+
+    def test_tied_backend_preflight_against_reference(self):
+        import torch.multiprocessing as mp
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(fsdp_worker, args=(directory, 'preflight_tied'), nprocs=2, join=True)
 
     def test_length_grouped_batches_reduce_padding_and_keep_partial_batch_last(self):
         from baseline.parallel import parallel_batches
@@ -385,7 +405,10 @@ class ParallelTests(unittest.TestCase):
     def test_two_rank_batch_four_variable_lengths_and_partial_batches(self):
         self.run_search_and_retrain(batch_size=4)
 
-    def run_search_and_retrain(self, batch_size):
+    def test_tied_model_batch_four_search_validation_retrain_and_adapter_reload(self):
+        self.run_search_and_retrain(batch_size=4, tied=True)
+
+    def run_search_and_retrain(self, batch_size, tied=False):
         import torch.multiprocessing as mp
         import torch
         from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -396,7 +419,7 @@ class ParallelTests(unittest.TestCase):
             torch.manual_seed(42)
             Qwen2ForCausalLM(Qwen2Config(vocab_size=16, hidden_size=16, intermediate_size=24,
                 num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=1,
-                max_position_embeddings=128, use_cache=False)).save_pretrained(root / 'backbone')
+                max_position_embeddings=128, use_cache=False, tie_word_embeddings=tied)).save_pretrained(root / 'backbone')
             sample_count = 43 if batch_size == 4 else 13
             with (root / 'train_dataset.csv').open('w', newline='', encoding='utf-8') as handle:
                 writer = csv.DictWriter(handle, fieldnames=['id', 'question', 'cot', 'answer', 'unit'])
@@ -429,6 +452,7 @@ class ParallelTests(unittest.TestCase):
             self.assertEqual(search['model']['activation_checkpointing'], 'inside FSDP; non-reentrant')
             self.assertTrue(search['group_by_length'])
             self.assertTrue(search['model']['replicated_lora'])
+            self.assertEqual(search['model']['replicated_frozen_embedding'], tied)
             for worker in range(2):
                 progress = json.loads((root / f'final/rank-{worker}-progress.json').read_text())
                 self.assertEqual(progress['phase'], 'complete')

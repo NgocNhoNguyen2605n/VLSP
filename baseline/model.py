@@ -79,7 +79,7 @@ def require_gpus(cfg, plan):
 
 
 def load_model(cfg, training=False, adapter=None, cpu_init=False):
-    """Nạp Qwen2.5-Math FP16 và adapter LoRA cho task văn bản."""
+    """Nạp backbone Qwen2/Qwen2.5 FP16 và adapter LoRA cho task văn bản."""
     text, mapping, plan = backbone_plan(cfg)
     if not cpu_init:
         require_gpus(cfg, plan)
