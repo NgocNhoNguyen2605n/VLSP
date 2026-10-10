@@ -12,13 +12,13 @@ from .runtime import save_json
 
 
 def checkpoint_rank(result):
-    """Đúng đáp án/đơn vị, exact, loss, epoch sớm, rồi seed nhỏ hơn."""
+    """Đúng đáp án/đơn vị, exact, loss, rồi epoch sớm hơn."""
     total = result["total"]
     loss = result["validation_loss"]
     if total <= 0 or not math.isfinite(loss):
         raise ValueError("Checkpoint thiếu validation hợp lệ.")
     return (result["content_tolerant"] / total, result["content_exact"] / total,
-            -loss, -result["epoch"], -result["seed"])
+            -loss, -result["epoch"])
 
 
 def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir):

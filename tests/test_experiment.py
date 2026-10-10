@@ -1,4 +1,4 @@
-"""Kiểm tra split, xếp hạng và luồng 5 seed + train cuối bằng Qwen2 nhỏ trên CPU."""
+"""Kiểm tra split, xếp hạng và luồng 5 epoch + train cuối bằng Qwen2 nhỏ trên CPU."""
 
 import contextlib
 import csv
@@ -6,7 +6,6 @@ import io
 import json
 import tempfile
 import unittest
-from collections import defaultdict
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,14 +55,14 @@ class SplitTests(unittest.TestCase):
         base = {"total": 10, "content_tolerant": 5, "content_exact": 4,
                 "validation_loss": 1.0, "epoch": 2, "seed": 42}
         self.assertGreater(checkpoint_rank({**base, "content_tolerant": 6, "validation_loss": 9}), checkpoint_rank(base))
-        for change in ({"content_exact": 5}, {"validation_loss": 0.9}, {"epoch": 1}, {"seed": 41}):
+        for change in ({"content_exact": 5}, {"validation_loss": 0.9}, {"epoch": 1}):
             self.assertGreater(checkpoint_rank({**base, **change}), checkpoint_rank(base))
         with self.assertRaises(ValueError):
             checkpoint_rank({**base, "validation_loss": float("nan")})
 
 
 class ExperimentTests(unittest.TestCase):
-    def test_failed_seed_does_not_start_final_training(self):
+    def test_failed_search_does_not_start_final_training(self):
         from baseline.experiment import run_experiment
 
         with tempfile.TemporaryDirectory() as directory:
@@ -83,15 +82,18 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertFalse((root / "experiment/configs/final.json").exists())
 
-    def test_requires_five_distinct_seeds(self):
+    def test_requires_valid_seed_and_epoch_count(self):
         from baseline.experiment import run_experiment
 
         cfg = json.loads(Path("configs/baseline.json").read_text())
-        for seeds in ([42], [42] * 5, [42, 43, 44, 45, True]):
-            with self.assertRaisesRegex(ValueError, "5 seed"):
-                run_experiment({**cfg, "search_seeds": seeds})
+        for seed in (True, -1, 2**32):
+            with self.assertRaisesRegex(ValueError, "seed"):
+                run_experiment({**cfg, "seed": seed})
+        for epochs in (True, 0, -1, 2.5):
+            with self.assertRaisesRegex(ValueError, "epochs"):
+                run_experiment({**cfg, "epochs": epochs})
 
-    def test_five_real_cpu_runs_and_fresh_final_training(self):
+    def test_five_epochs_and_fresh_final_training(self):
         import torch
         from transformers import Qwen2Config, Qwen2ForCausalLM
         from baseline.experiment import run_experiment
@@ -126,7 +128,7 @@ class ExperimentTests(unittest.TestCase):
             cfg.update(model_id=str(root / "backbone"), revision="local-test", data_root=str(root),
                        output_dir=str(root / "experiment"), max_length=32, lora_rank=2, lora_alpha=4,
                        loss_chunk_size=3, batch_size=3, gradient_accumulation_steps=2)
-            calls, initialized = defaultdict(int), []
+            calls, initialized = [], []
 
             def cpu_plan(config):
                 text, mapping, plan = backbone_plan(config)
@@ -141,9 +143,9 @@ class ExperimentTests(unittest.TestCase):
                 return model, plan
 
             def generation(model, tokenizer, question, config):
-                calls[config["seed"]] += 1
-                epoch = (calls[config["seed"]] - 1) // 3 + 1
-                answer = "1" if config["seed"] == 45 and epoch == 2 else "99"
+                calls.append(question)
+                epoch = (len(calls) - 1) // 3 + 1
+                answer = "1" if epoch == 3 else "99"
                 return json.dumps({"answer": answer, "unit": "V", "explanation": "Giải"}), 0.1, 10, True
 
             def runner(path):
@@ -155,19 +157,26 @@ class ExperimentTests(unittest.TestCase):
                   patch("baseline.train.load_tokenizer", return_value=Tokenizer()),
                   patch("baseline.validation.generate_once", generation),
                   contextlib.redirect_stdout(io.StringIO())):
-                result = run_experiment(cfg, runner=runner)
+                # Trường cấu hình cũ không được kích hoạt thêm 5 run theo seed.
+                result = run_experiment({**cfg, "search_seeds": [42, 43, 44, 45, 46]}, runner=runner)
             self.assertEqual(result["status"], "complete")
-            self.assertEqual(result["completed_seeds"], [42, 43, 44, 45, 46])
-            self.assertEqual(initialized, [("search", seed) for seed in range(42, 47)] + [("final", 45)])
-            self.assertEqual((result["best_checkpoint"]["seed"], result["best_checkpoint"]["epoch"]), (45, 2))
+            self.assertEqual(result["completed_epochs"], [1, 2, 3, 4, 5])
+            self.assertEqual(initialized, [("search", 42), ("final", 42)])
+            self.assertEqual(len(calls), 15)  # 3 câu validation, chấm sau mỗi epoch.
+            self.assertNotIn("search_seeds", result["config"])
+            self.assertEqual((result["best_checkpoint"]["seed"], result["best_checkpoint"]["epoch"]), (42, 3))
             final = json.loads((root / "experiment/final/run.json").read_text())
             self.assertEqual(final["training_samples"], 30)
-            self.assertEqual(final["config"]["epochs"], 2)
+            self.assertEqual(final["config"]["epochs"], 3)
+            self.assertEqual(len(json.loads((root / "experiment/final/train_log.json").read_text())), 3)
+            search = json.loads((root / "experiment/search/run.json").read_text())
+            self.assertEqual(search["training_samples"], 27)
+            self.assertEqual(search["config"]["epochs"], 5)
             self.assertIsNone(final["split"])
             self.assertEqual(set(final["data"]), {"train"})  # Không cần dev CSV cho cả search/final.
             self.assertTrue((root / "experiment/final/adapter/adapter_config.json").is_file())
             selection = json.loads((root / "experiment/selection.json").read_text())
-            self.assertEqual(len(selection["candidates"]), 15)
+            self.assertEqual(len(selection["candidates"]), 5)
             with self.assertRaises(FileExistsError):
                 run_experiment(cfg, runner=runner)
 
