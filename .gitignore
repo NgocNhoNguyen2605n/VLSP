@@ -8,8 +8,10 @@ outputs/
 hf_cache/
 *.safetensors
 *.bin
-train_dataset.csv
-dev_dataset.csv
+/train_dataset.csv
+/dev_dataset.csv
+!data/train_dataset.csv
+!data/dev_dataset.csv
 deployment*/
 .venv-serving/
 .venv-api/
