@@ -10,7 +10,7 @@
   "dev_file": null,
   "output_dir": "/kaggle/working/vipra_qwen25_math_7b_5epochs",
   "skip_missing_answer": false,
-  "max_length": 1024,
+  "max_length": 2048,
   "epochs": 5,
   "checkpoint_selection": "fixed_epoch",
   "selected_epoch": 5,
