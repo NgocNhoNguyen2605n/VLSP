@@ -135,7 +135,8 @@ def train(cfg):
                         successful_updates += 1
                         consecutive_skips = 0
                     updates += 1
-                progress.update(index + 1)
+                current_loss = epoch_sum / epoch_tokens if epoch_tokens > 0 else loss.item()
+                progress.update(index + 1, extra=f"loss={current_loss:.4f} (batch={loss.item():.4f})")
         history.append({"epoch": epoch, "loss": epoch_sum / epoch_tokens,
                         "training_seconds": time.monotonic() - epoch_start,
                         "skipped_optimizer_steps": skipped_updates,

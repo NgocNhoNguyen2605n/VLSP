@@ -380,6 +380,7 @@ def train_parallel(cfg, device):
             learner.train()
             optimizer.zero_grad(set_to_none=True)
             totals = torch.zeros(2, dtype=torch.float64, device=device)
+            global_loss_sum, global_tokens = 0.0, 0
             epoch_start = time.monotonic()
             with BatchProgress(f"Epoch {epoch}/{cfg['epochs']}", micro_steps,
                                enabled=primary, remaining_label="Còn epoch",
@@ -408,6 +409,8 @@ def train_parallel(cfg, device):
                         raise FloatingPointError(f"Loss không hữu hạn tại epoch {epoch}, micro-step {index + 1}.")
                     totals[0] += loss.detach().double() * tokens
                     totals[1] += tokens
+                    global_loss_sum += batch_metrics[1].item()
+                    global_tokens += int(batch_metrics[2].item())
                     # All-reduce lấy trung bình giữa rank; nhóm cuối chia theo số mẫu thật.
                     mark("backward")
                     (loss * (world * valid_samples / group_samples) * scaler.scale).backward()
@@ -429,7 +432,9 @@ def train_parallel(cfg, device):
                             successful += 1
                             consecutive_skips = 0
                     mark("batch_complete", successful_optimizer_steps=successful, skipped_optimizer_steps=skipped_steps)
-                    batch_progress.update(index + 1)
+                    current_loss = global_loss_sum / global_tokens if global_tokens > 0 else loss.item()
+                    batch_loss = (batch_metrics[1] / batch_metrics[2]).item() if batch_metrics[2].item() > 0 else loss.item()
+                    batch_progress.update(index + 1, extra=f"loss={current_loss:.4f} (batch={batch_loss:.4f})")
             finish_device_work(device)
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
             if not successful:
