@@ -10,6 +10,7 @@ import httpx
 
 from .predict import load_queries
 from .schema import validate_response
+from .config import DEFAULT_MODEL_NAME
 
 
 def check(base_url, model_name, output_file, probe_file=None, client=None):
@@ -57,7 +58,7 @@ def check(base_url, model_name, output_file, probe_file=None, client=None):
 def main():
     parser = argparse.ArgumentParser(description="Probe API từ máy khác trước khi nộp")
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--model-name", default="Viper-Qwen2.5-3B-LoRA")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--probe-file", help="CSV/JSON/JSONL chỉ lấy query_id/query; có thể dùng dev để thử")
     parser.add_argument("--output", default="outputs/preflight.json")
     args = parser.parse_args()

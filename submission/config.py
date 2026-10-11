@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-BASE_MODEL = "Qwen/Qwen2.5-3B-Instruct"
-REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
-BASE_PARAMETERS = 3_085_938_688
+BASE_MODEL = "Qwen/Qwen2.5-Math-7B-Instruct"
+REVISION = "ef9926d75ab1d54532f6a30dd5e760355eb9aa4d"
+BASE_PARAMETERS = 7_615_616_512
+DEFAULT_MODEL_NAME = "Viper-Qwen2.5-Math-7B-LoRA"
 
 
 @dataclass(frozen=True)
@@ -16,7 +17,7 @@ class ServingConfig:
     team_name: str = "Viper"
     base_model: str = BASE_MODEL
     revision: str = REVISION
-    model_name: str = "Viper-Qwen2.5-3B-LoRA"
+    model_name: str = DEFAULT_MODEL_NAME
     adapter_path: str | None = None
     backend_url: str = "http://127.0.0.1:8000"
     max_new_tokens: int = 300
@@ -30,7 +31,7 @@ class ServingConfig:
 
     def __post_init__(self):
         if self.base_model != BASE_MODEL or self.revision != REVISION:
-            raise ValueError("Serving này yêu cầu đúng backbone/revision Qwen2.5-3B của repo.")
+            raise ValueError(f"Serving này yêu cầu đúng backbone/revision {BASE_MODEL} của repo.")
         if not self.model_name.strip() or not self.team_name.strip():
             raise ValueError("team_name/model_name không được rỗng.")
         if type(self.max_new_tokens) is not int or not 0 < self.max_new_tokens < self.max_model_len:

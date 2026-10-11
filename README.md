@@ -23,12 +23,14 @@ Mac Apple Silicon có đường serving riêng bằng vLLM Metal: đọc [MAC_SE
 
 ## Baseline LoRA trên Kaggle
 
-Baseline: `Qwen/Qwen2.5-3B-Instruct`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Model/tokenizer/template được cố định tại revision `aa8e72537993ba99e69dfaafa59ed015b17504d1`.
+Baseline: `Qwen/Qwen2.5-Math-7B-Instruct`, backbone FP16, **LoRA thuần**, không lượng tử hóa. Model/tokenizer/template được cố định tại revision `ef9926d75ab1d54532f6a30dd5e760355eb9aa4d`.
 
-- Train **5 epoch với seed 42**, chọn epoch có điểm validation cao nhất. Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU (effective batch 16), LoRA rank 16/alpha 32/dropout 0 (29.933.568 tham số học), learning rate `1e-3`. Validation generation batch 4.
-- Backbone có **3.085.938.688 tham số**, dưới giới hạn 8B. Trọng số FP16 khoảng **5,75 GiB tổng**. Training dùng **FSDP2 chia backbone frozen**, hai T4 xử lý các batch khác nhau đồng thời. Embedding/head dùng chung một trọng số frozen, được giữ nguyên đầy đủ trên mỗi GPU; decoder frozen được shard và LoRA được nhân bản; riêng trọng số backbone khoảng **3,16 GiB/GPU**. LoRA FP32 + gradient + hai trạng thái AdamW khoảng **0,45 GiB/GPU**, chưa gồm activation và buffer giao tiếp. Micro-batch 4/GPU; activation checkpointing và chunked loss giảm VRAM; vẫn cần đo VRAM thực tế trên Kaggle.
-- Dùng chat template Qwen2.5-3B-Instruct chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Sinh greedy một lần mỗi câu; không dùng công cụ tính toán bên ngoài.
-- Model hỗ trợ tiếng Việt, toán và JSON theo model card. Khả năng giải vật lý tiếng Việt cần được đo trên dev; chưa có kết quả để khẳng định cải thiện so với backbone trước.
+- Train **5 epoch với seed 42**, mặc định xuất checkpoint epoch 5 (`fixed_epoch`). Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU (effective batch 16), LoRA rank 16/alpha 32/dropout 0 (40.370.176 tham số học), learning rate baseline đơn lẻ `1e-4`. Sweep vẫn thử ba learning rate đã cấu hình.
+- Backbone có **7.615.616.512 tham số**, LoRA thêm **40.370.176**, tổng **7.655.986.688 < 8B**. Trọng số FP16 khoảng **14,19 GiB tổng**. Qwen2.5-Math-7B có embedding và lm_head riêng (`tie_word_embeddings=false`): FSDP2 shard decoder/embedding, giữ lm_head frozen và LoRA đầy đủ trên mỗi GPU. Riêng backbone khoảng **7,60 GiB/GPU**; LoRA FP32 + gradient + hai trạng thái AdamW khoảng **0,60 GiB/GPU**, chưa gồm activation/buffer. Micro-batch 4/GPU; cần đo peak VRAM thực tế trên T4 x2.
+- Dùng chat template Qwen2.5-Math-7B-Instruct chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Sinh greedy một lần mỗi câu; không dùng công cụ tính toán bên ngoài.
+- Model card Qwen2.5-Math tập trung vào toán tiếng Anh và tiếng Trung. Khả năng giải vật lý tiếng Việt và trả JSON cần được đo sau fine-tuning trên dev; chưa có kết quả để khẳng định cải thiện so với backbone trước.
+
+Model 7B dùng revision riêng; adapter/checkpoint của model 3B cũ không tương thích. Dùng thư mục output mới và train lại LoRA. Context của model Math là **4096 token**; max_length training vẫn 2048, max_new_tokens vẫn 1000. Serving FP16 trên một GPU nên dùng máy có đủ chỗ cho 14,19 GiB trọng số cùng KV cache/runtime; GPU 24 GiB có nhiều dư địa hơn T4 16 GiB. Chưa đo latency/VRAM của 7B trên máy triển khai.
 
 Clone nhánh `Nhotest` trên Kaggle:
 
@@ -46,7 +48,7 @@ Sau khi clone repo về chạy lần lượt:
 
 ```python
 !python -m baseline.check
-!python -m baseline.experiment --output-dir /kaggle/working/vipra_qwen25_3b_train_dev01
+!python -m baseline.experiment --output-dir /kaggle/working/vipra_qwen25_math_7b_train_dev01
 ```
 
 ## Train đầy đủ, validation trên dev, lưu best checkpoint
@@ -58,16 +60,16 @@ Adapter xuất ra lấy đúng checkpoint epoch 5; dev loss không thay đổi e
 Sweep so sánh dev loss tại epoch cố định; muốn đo accuracy, gọi evaluate riêng sau khi chọn cấu hình.
 Chế độ cũ bên dưới chỉ áp dụng khi đặt `checkpoint_selection="answer_accuracy"`.
 
-Khi sinh đáp án validation bằng FSDP2, `validation_keep_unsharded=true` (mặc định)
+Với 7B, `validation_keep_unsharded=false` là mặc định. Nếu có đủ VRAM, có thể bật `true`:
 giữ trọng số backbone đầy đủ trên mỗi GPU trong toàn bộ vòng generation.
 Batch đầu vẫn gom trọng số và thời gian này nằm trong timer; các token/batch sau dùng lại
 trọng số, tránh all-gather mỗi token. Dev loss vẫn chạy với sharding thông thường.
 Sau generation, kể cả khi có exception, code reshard từng module và khôi phục policy
 training (root=False, embedding/decoder=True). KV cache, greedy, prompt và adapter giữ cùng cấu hình.
 `generation_keep_unsharded` trong metrics ghi nhận chế độ đã dùng.
-Chế độ này tăng VRAM: khoảng 5,75 GiB trọng số đầy đủ/GPU, còn cần chỗ cho shard/buffer,
+Chế độ này tăng VRAM: khoảng 14,19 GiB trọng số đầy đủ/GPU, còn cần chỗ cho shard/buffer,
 LoRA/optimizer, KV cache và activation. Cần đo peak VRAM/tốc độ trên T4;
-nếu thiếu VRAM, đặt `validation_keep_unsharded=false` để dùng đường generation cũ.
+nếu thiếu VRAM, giữ `validation_keep_unsharded=false` để shard lại sau mỗi forward.
 Với `fixed_epoch`, chỉ tính loss nên không vào chế độ giữ trọng số generation.
 Lệnh evaluate riêng dùng model chia lớp trong một tiến trình, không dùng FSDP2.
 
@@ -79,7 +81,7 @@ Lệnh evaluate riêng dùng model chia lớp trong một tiến trình, không 
 Launcher tự tạo 2 worker FSDP song song, một worker/GPU. Mỗi cấu hình dùng thư mục output mới. `baseline.train` CLI mặc định gọi cùng workflow. Notebook hiển thị điểm dev đã lưu của best epoch; không tự sinh lại dev thêm lần nữa. Có thể gọi riêng lệnh dưới để đo lại thời gian từng câu; đây vẫn là điểm trên tập validation đã dùng chọn model, không phải test độc lập:
 
 ```python
-!python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen25_3b_train_dev01
+!python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen25_math_7b_train_dev01
 ```
 
 ## Thực nghiệm nhiều learning rate và giới hạn sinh
@@ -104,7 +106,7 @@ không cắt nhãn xuống 300 hoặc 1000 token. EOS hoặc deadline **60 giây
 trước giới hạn token; `unfinished_generation` ghi số câu chưa có EOS.
 
 Mỗi trial có thư mục riêng, `adapter/` lấy checkpoint tốt nhất của chính trial.
-`results.csv` xếp các trial hoàn tất theo điểm đáp án + đơn vị, exact, loss và epoch;
+`results.csv` mặc định xếp trial theo dev loss tại selected_epoch; nếu bật answer_accuracy mới xếp theo đáp án + đơn vị, exact, loss và epoch;
 `sweep.json` lưu cấu hình, trạng thái, checkpoint thắng toàn sweep và đường dẫn adapter.
 Bảng kết quả được cập nhật sau mỗi trial, kể cả khi một run lỗi.
 Bộ chạy dừng ngay khi lỗi; không tự chạy tiếp sau NCCL abort. Sau khi restart session,
@@ -119,7 +121,7 @@ Nếu LR/grid/base config hoặc hash train/dev thay đổi thì phải dùng ou
 Đổi lưới qua `--grid-config <file.json>`; baseline đơn lẻ vẫn dùng `python -m baseline.experiment`.
 Notebook mặc định chạy sweep và hiển thị best trial, không tự đánh giá lại dev.
 
-Qwen2.5-3B-Instruct sinh lời giải trong `explanation` theo prompt của repo; không dùng thẻ `<think>`
+Qwen2.5-Math-7B-Instruct sinh lời giải trong `explanation` theo prompt của repo; không dùng thẻ `<think>`
 hay tùy chọn `enable_thinking` của các model có chế độ thinking. Nhãn training lấy `cot` vào
 `explanation` rồi `answer`/`unit`, học bằng teacher forcing. Validation model tự sinh lời giải và đáp án.
 Giới hạn token tính cho toàn bộ JSON; CoT dài có thể chiếm hết 300 token trước khi tới answer.
@@ -131,12 +133,12 @@ Giới hạn token tính cho toàn bộ JSON; CoT dài có thể chiếm hết 3
 - Backbone nạp trên CPU lần lượt từng rank rồi shard từng lớp sang GPU, tránh đưa cả backbone đầy đủ lên mỗi T4 hoặc giữ hai bản CPU đầy đủ cùng lúc. Backbone FP16, RMSNorm/LoRA FP32, AdamW chỉ học LoRA.
 - LoRA dùng `ignored_params` của FSDP2, giữ bản FP32 đầy đủ trên từng GPU và broadcast từ rank 0 khi khởi tạo. FSDP không reduce-scatter gradient. Sau mỗi nhóm tích lũy, chờ backward hoàn tất trên mọi CUDA stream rồi all-reduce gradient LoRA theo các bucket tối đa 8 MiB, thứ tự cố định, chia cho world size. Rank thiếu gradient gửi 0 cùng shape; tham số unused trên mọi rank vẫn giữ `grad=None`. Các pha forward/backward được chờ hoàn tất trước collective kiểm tra loss hoặc gradient để tránh xen collective điều khiển với all-gather. Cách này bỏ overlap giao tiếp gradient trong backward, ưu tiên tránh lỗi NCCL đã quan sát; không bảo đảm tăng tốc.
 - Overflow được đồng bộ: nếu một rank có NaN/Inf, cả hai rank cùng bỏ optimizer step, giảm loss scale và không tăng scheduler. Clipping tính norm của gradient đã bình quân và đồng bộ; không cộng lại norm theo số GPU.
-- Checkpoint lấy LoRA đã đồng bộ về CPU từ rank 0 rồi ghi adapter/JSON. Không gather cả backbone 3B để lưu. Adapter cuối vẫn nạp bằng PEFT thông thường.
-- Decoder dùng activation checkpoint của PyTorch **bên trong module FSDP**, thay cho checkpoint của Transformers bọc cả lời gọi có hook FSDP. **Tắt backward prefetch**, decoder chỉ all-gather khi backward cần chính lớp đó. FSDP2 coi danh sách prefetch rỗng là dùng lịch mặc định, nên code dùng embedding frozen (`set_unshard_in_backward(False)`) làm target no-op cho root/decoder. Cách này tránh all-gather từ hook prefetch và giảm overlap giao tiếp/tính toán; cần đo lại tốc độ trên T4. Qwen2.5-3B dùng embedding/head chung: trọng số này nằm trong ignored_params, replicate một tensor frozen/GPU và giữ cùng Parameter identity sau chuyển device. Embedding vẫn có hook FSDP nhưng không có trọng số cần all-gather; root chỉ shard norm nhỏ. Với backbone không tied, embedding vẫn shard riêng. [API prefetch/unshard của PyTorch](https://docs.pytorch.org/docs/2.8/distributed.fsdp.fully_shard.html).
+- Checkpoint lấy LoRA đã đồng bộ về CPU từ rank 0 rồi ghi adapter/JSON. Không gather cả backbone 7B để lưu. Adapter cuối vẫn nạp bằng PEFT thông thường.
+- Decoder dùng activation checkpoint của PyTorch **bên trong module FSDP**, thay cho checkpoint của Transformers bọc cả lời gọi có hook FSDP. **Tắt backward prefetch**, decoder chỉ all-gather khi backward cần chính lớp đó. FSDP2 coi danh sách prefetch rỗng là dùng lịch mặc định, nên code dùng embedding frozen (`set_unshard_in_backward(False)`) làm target no-op cho root/decoder. Cách này tránh all-gather từ hook prefetch và giảm overlap giao tiếp/tính toán; cần đo lại tốc độ trên T4. Qwen2.5-Math-7B có embedding/head riêng: embedding được shard, lm_head frozen được replicate để tránh số collective khác nhau khi các rank có số chunk loss khác nhau. LoRA FP32 nằm trong ignored_params. Đường tied embedding vẫn được giữ cho các test model nhỏ, nhưng không dùng cho backbone 7B này. [API prefetch/unshard của PyTorch](https://docs.pytorch.org/docs/2.8/distributed.fsdp.fully_shard.html).
 - Validation cần mọi rank tham gia cùng câu hỏi vì FSDP có collective. Generation dùng `synced_gpus=True` để tránh kẹt khi EOS/deadline khác nhau; rank 0 ghi prediction và quyết định điểm. Validation không chia câu hỏi riêng cho từng GPU. Đánh giá dev sau cùng dùng model chia lớp trong một tiến trình như trước.
 - Seed/split/revision được cố định; effective batch hiện tại là 16. `deterministic_algorithms(..., warn_only=True)` vẫn chỉ cảnh báo kernel không xác định. Không bảo đảm giống từng bit hoặc khớp kết quả của cách chạy chia lớp trước đây. FSDP có chi phí truyền trọng số, cần đo tốc độ thực tế trên T4; không mặc nhiên nhanh gấp đôi.
-- Tiến độ có dạng `Epoch 1/5 | Batch 11/85 | Còn epoch ~00:07:35`. Terminal TTY ghi đè một dòng mỗi batch. Output được thu qua pipe (notebook/Save Version) in dòng hoàn chỉnh và flush ngay: batch 0, batch 1, mỗi `log_every` batch (mặc định 10), batch cuối; nếu đã qua 30 giây từ lần in trước thì batch vừa hoàn tất cũng được in. Cách này tránh log Save Version phải chờ hết epoch mới có ký tự xuống dòng. Mốc 30 giây chỉ được kiểm tra khi batch hoàn tất, không phải heartbeat khi một batch đang chạy. ETA dựa trên thời gian trung bình của các batch đã chạy trong epoch; không cộng validation/checkpoint. Validation loss và generation có tiến độ/ETA riêng; generation dùng batch 4 câu, tối đa 300 token mới/câu. Left padding và attention mask được tạo riêng; output được cắt tại EOS đầu tiên để không tính padding sau khi câu đã kết thúc. `seconds` của mỗi câu validation là thời gian chung của batch, không chia cho 4. Lệnh evaluate riêng vẫn sinh một câu/lượt để đo thời gian từng truy vấn. Chỉ rank 0 in FSDP. Batch 4/GPU × 2 GPU xử lý tối đa 8 mẫu/lượt: 677 mẫu train có **85 batch/epoch**, dev 339 mẫu có **85 batch validation/epoch**.
-- Trước khi nạp 3B, mỗi run tự kiểm tra backend thực tế bằng Qwen nhỏ: embedding/head tied như backbone hiện tại, batch 4 với độ dài khác nhau, 3 optimizer steps × tích lũy 4 batch (12 micro-batches), no-grad forward giữa các bước, đồng bộ gradient và optimizer/clipping đối chiếu model không shard. Kaggle phải hiện `Preflight PASS` trên backend NCCL. Kết quả lưu trong `run.json/config/distributed_preflight`. Đây là kiểm tra đường chạy CUDA/NCCL, không thay thế kiểm tra tải/VRAM của model 3B.
+- Tiến độ có dạng `Epoch 1/5 | Batch 11/85 | Còn epoch ~00:07:35`. Terminal TTY ghi đè một dòng mỗi batch. Output được thu qua pipe (notebook/Save Version) in dòng hoàn chỉnh và flush ngay: batch 0, batch 1, mỗi `log_every` batch (mặc định 10), batch cuối; nếu đã qua 30 giây từ lần in trước thì batch vừa hoàn tất cũng được in. Cách này tránh log Save Version phải chờ hết epoch mới có ký tự xuống dòng. Mốc 30 giây chỉ được kiểm tra khi batch hoàn tất, không phải heartbeat khi một batch đang chạy. ETA dựa trên thời gian trung bình của các batch đã chạy trong epoch; không cộng validation/checkpoint. Validation loss và generation có tiến độ/ETA riêng; generation dùng batch 4 câu; max_new_tokens của baseline là 1000, sweep thử 300/1000. Với fixed_epoch không chạy generation mỗi epoch. Left padding và attention mask được tạo riêng; output được cắt tại EOS đầu tiên để không tính padding sau khi câu đã kết thúc. `seconds` của mỗi câu validation là thời gian chung của batch, không chia cho 4. Lệnh evaluate riêng vẫn sinh một câu/lượt để đo thời gian từng truy vấn. Chỉ rank 0 in FSDP. Batch 4/GPU × 2 GPU xử lý tối đa 8 mẫu/lượt: 677 mẫu train có **85 batch/epoch**, dev 339 mẫu có **85 batch validation/epoch**.
+- Trước khi nạp 7B, mỗi run tự kiểm tra backend thực tế bằng Qwen nhỏ: embedding/head riêng như backbone hiện tại, batch 4 với độ dài khác nhau, 3 optimizer steps × tích lũy 4 batch (12 micro-batches), no-grad forward giữa các bước, đồng bộ gradient và optimizer/clipping đối chiếu model không shard. Kaggle phải hiện `Preflight PASS` trên backend NCCL. Kết quả lưu trong `run.json/config/distributed_preflight`. Đây là kiểm tra đường chạy CUDA/NCCL, không thay thế kiểm tra tải/VRAM của model 7B.
 - `verbose_logging=false` ẩn bảng hyperparameter, thống kê VRAM/scheduler/loss và summary từng epoch. Đổi thành `true` nếu cần in lại cấu hình chi tiết. Cấu hình, loss, số bước cập nhật và kết quả validation vẫn lưu trong `run.json`, `train_log.json` và `validation/epoch-*/metrics.json`. Cảnh báo overflow/lỗi vẫn được hiển thị.
 
 ## Đánh giá và độ ổn định
@@ -185,10 +187,10 @@ evaluation/predictions.jsonl
 | `baseline/runtime.py` | Seed, cấu hình và manifest |
 
 
-Kiểm tra CPU (model Qwen2 nhỏ, gồm hai tiến trình FSDP thật với Gloo, không tải trọng số 3B; test FSDP đã kiểm tra trên PyTorch 2.14): gradient đối chiếu reference cho cả tied/untied embedding, trọng số chung frozen không bị tách hoặc cập nhật, bucket/gradient thiếu, clipping không nhân norm theo world size, overflow, batch cuối/dummy, lưu/nạp adapter, 5 epoch trên toàn bộ train/chọn best theo dev/xuất đúng adapter thắng. Regression chạy 80 micro-batches với rank lệch nhịp, độ dài khác nhau và validation giữa các bước: chặn mọi all-gather phát sinh từ prefetch, kiểm tra mỗi decoder gather một lần/backward, hai rank cùng thứ tự/shape collective, gradient/trọng số khớp reference. Các integration test chặn `reduce_scatter_tensor` để bảo đảm training mới không gọi đường cũ. Backend NCCL/T4 được kiểm tra bằng preflight khi chạy trên Kaggle; local không có CUDA.
+Kiểm tra CPU (model Qwen2 nhỏ, gồm hai tiến trình FSDP thật với Gloo, không tải trọng số 7B; test FSDP đã kiểm tra trên PyTorch 2.14): gradient đối chiếu reference cho cả tied/untied embedding, trọng số chung frozen không bị tách hoặc cập nhật, bucket/gradient thiếu, clipping không nhân norm theo world size, overflow, batch cuối/dummy, lưu/nạp adapter, 5 epoch trên toàn bộ train/chọn best theo dev/xuất đúng adapter thắng. Regression chạy 80 micro-batches với rank lệch nhịp, độ dài khác nhau và validation giữa các bước: chặn mọi all-gather phát sinh từ prefetch, kiểm tra mỗi decoder gather một lần/backward, hai rank cùng thứ tự/shape collective, gradient/trọng số khớp reference. Các integration test chặn `reduce_scatter_tensor` để bảo đảm training mới không gọi đường cũ. Backend NCCL/T4 được kiểm tra bằng preflight khi chạy trên Kaggle; local không có CUDA.
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Nguồn: [PyTorch FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), [Qwen2.5-3B-Instruct model card](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct), [Qwen2 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen2), [PyTorch SDPA và độ chính xác](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).
+Nguồn: [PyTorch FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), [Qwen2.5-Math-7B-Instruct model card](https://huggingface.co/Qwen/Qwen2.5-Math-7B-Instruct), [Qwen2 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen2), [PyTorch SDPA và độ chính xác](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).

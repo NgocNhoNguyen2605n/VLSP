@@ -64,12 +64,13 @@ def create_report(train_file, dev_file, output, deployment=None, font=None, bold
     for row in train[:2]:
         add(escape(f"Sample {row['id']}: {row['question']} Answer: {row['answer']} {row['unit']}"))
     add("2. Method", "head")
-    cfg = provenance["training_config"] if provenance else {"epochs": 5, "seed": 42, "lora_rank": 16, "lora_alpha": 32, "lora_dropout": 0, "checkpoint_selection": "fixed_epoch", "selected_epoch": 5, "max_new_tokens": 300}
+    cfg = provenance["training_config"] if provenance else json.loads((Path(__file__).resolve().parents[1] / "configs/baseline.json").read_text(encoding="utf-8"))
     epoch = provenance["adapter_epoch"] if provenance else cfg["selected_epoch"]
-    add(f"Qwen2.5-3B-Instruct uses its official chat template. Supervised fine-tuning maps each question to one JSON object containing explanation, answer, unit and reasoning=null. Teacher forcing learns only assistant tokens. Training uses FP16 frozen backbone, FP32 LoRA, seed {cfg['seed']} and {cfg['epochs']} epochs; FSDP2 distributes training across GPUs. The exported adapter is epoch {epoch} ({escape(str(cfg.get('checkpoint_selection', 'answer_accuracy')))} selection).")
+    add(f"{BASE_MODEL.split('/')[-1]} uses its official chat template. Supervised fine-tuning maps each question to one JSON object containing explanation, answer, unit and reasoning=null. Teacher forcing learns only assistant tokens. Training uses FP16 frozen backbone, FP32 LoRA, seed {cfg['seed']} and {cfg['epochs']} epochs; FSDP2 distributes training across GPUs. The exported adapter is epoch {epoch} ({escape(str(cfg.get('checkpoint_selection', 'answer_accuracy')))} selection).")
     add(f"Inference runs one self-hosted vLLM engine with the selected LoRA. The training prompt is retained; greedy decoding generates explanation and answer in one call, at most {cfg['max_new_tokens']} new tokens. The API attaches the original query_id, normalizes known units to ASCII, and returns a one-element JSON list. Multipart answers and units use '; ' in matching order. No answer labels, retrieval system, external solver or third-party inference API are used at prediction time.")
     add("3. Models and capacity", "head")
-    adapter = provenance["adapter_parameters"] if provenance else 29_933_568
+    # Qwen2.5-Math-7B: 28 lớp, tổng (in + out) của 7 projection/lớp = 90,112.
+    adapter = provenance["adapter_parameters"] if provenance else cfg["lora_rank"] * 28 * 90_112
     total = BASE_PARAMETERS + adapter
     add(f"Only LLM: {BASE_MODEL} ({BASE_PARAMETERS:,} parameters), plus LoRA ({adapter:,} parameters). Conservative total: {BASE_PARAMETERS:,} + {adapter:,} = {total:,} &lt; 8,000,000,000. vLLM model cards for the backbone and LoRA refer to one shared backbone instance. No other LLM is loaded for this solution.")
     add("4. Serving contract", "head")

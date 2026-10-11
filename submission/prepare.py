@@ -64,7 +64,7 @@ def prepare(output_dir, run_dir=None, base_only=False, team_name="Viper"):
         adapter = source / "adapter"
         adapter_cfg = json.loads((adapter / "adapter_config.json").read_text())
         if adapter_cfg.get("base_model_name_or_path") != BASE_MODEL or adapter_cfg.get("peft_type") != "LORA":
-            raise ValueError("Adapter không phải LoRA của Qwen2.5-3B-Instruct.")
+            raise ValueError(f"Adapter không phải LoRA của {BASE_MODEL}.")
         weights = adapter / "adapter_model.safetensors"
         from safetensors import safe_open
         with safe_open(str(weights), framework="pt", device="cpu") as tensors:

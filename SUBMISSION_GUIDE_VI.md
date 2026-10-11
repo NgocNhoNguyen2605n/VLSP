@@ -23,7 +23,9 @@ Serve: câu hỏi -> /predict -> vLLM + adapter -> JSON answer/unit/explanation
                       /v1/models -> danh sách model thật từ vLLM
 ```
 
-FSDP2 phục vụ training hai GPU. Serving chỉ dùng **một GPU và một backbone** trong vLLM, gắn LoRA vào backbone đó. Hai model card base/adapter trong /v1/models không có nghĩa nạp hai backbone. Tổng dự kiến kể cả LoRA: 3.085.938.688 + 29.933.568 = **3.115.872.256 < 8B**. Công cụ prepare sẽ đếm lại tham số adapter thật.
+FSDP2 phục vụ training hai GPU. Serving chỉ dùng **một GPU và một backbone** trong vLLM, gắn LoRA vào backbone đó. Hai model card base/adapter trong /v1/models không có nghĩa nạp hai backbone. Tổng dự kiến kể cả LoRA: 7.615.616.512 + 40.370.176 = **7.655.986.688 < 8B**. Công cụ prepare sẽ đếm lại tham số adapter thật.
+
+Sau khi đổi sang Math-7B, phải train adapter mới và chạy prepare từ run 7B đã hoàn tất; adapter/deployment 3B cũ không tương thích. Trọng số FP16 khoảng 14,19 GiB chưa gồm KV cache/runtime; chọn máy serving đủ VRAM (GPU 24 GiB có nhiều dư địa hơn T4 16 GiB).
 
 Prompt được lấy nguyên từ baseline.data.prompt_messages; greedy, seed/max token kế thừa run. vLLM dùng implementation khác Transformers nên không bảo đảm đáp án từng token giống hệt evaluation cũ. Phải đo chất lượng và thời gian trên dev khi có checkpoint; hiện chưa có số đo GPU. Giới hạn sinh token không được tự giảm nếu chưa xem model có bị cắt JSON/lời giải hay không.
 
@@ -87,7 +89,7 @@ Trên máy khác (có thể Mac của bạn), trong thư mục mã nguồn:
 
 ```bash
 python -m pip install -r requirements-serving.txt
-python -m submission.check --base-url https://TEN-MIEN-THAT --model-name Viper-Qwen2.5-3B-LoRA
+python -m submission.check --base-url https://TEN-MIEN-THAT --model-name Viper-Qwen2.5-Math-7B-LoRA
 ```
 
 Công cụ gọi /v1/models thật và ba câu thử, kiểm tra schema và ghi thời gian từng câu vào outputs/preflight.json. Muốn đo nhiều câu dev, thêm `--probe-file /path/dev_dataset.csv --output outputs/dev_preflight.json`. Chỉ câu hỏi được gửi, không gửi answer/cot. Kiểm tra schema/thời gian không chứng minh accuracy: dùng kết quả prediction so với dev để đánh giá riêng.

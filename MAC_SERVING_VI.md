@@ -1,6 +1,6 @@
 # Chạy Viper trên MacBook Pro M5
 
-Máy hiện tại: M5, 16 GiB unified memory, macOS 26.6.1. Chạy inference từng câu bằng vLLM Metal; training FSDP2 vẫn ở môi trường NVIDIA. Không cần Docker cho đường chạy Mac này.
+Nhánh Nhotest hiện dùng Qwen2.5-Math-7B-Instruct FP16. Riêng trọng số đã khoảng 14,19 GiB, chưa gồm macOS, KV cache và runtime; cấu hình Mac M5 16 GiB cũ với ngân sách 65% không đủ cho profile này. Cần máy có thêm bộ nhớ và đo thực tế; hướng dẫn dưới mô tả đường chạy Metal, chưa xác nhận 7B chạy được trên Mac hiện tại. Training FSDP2 vẫn ở NVIDIA.
 
 ## Các thành phần
 
@@ -8,7 +8,7 @@ Máy hiện tại: M5, 16 GiB unified memory, macOS 26.6.1. Chạy inference t�
 |---|---|
 | vLLM Metal | ~/.venv-vllm-metal; chạy Qwen + LoRA trên GPU Apple |
 | API Python | .venv-api; nhận input BTC, gọi vLLM và định dạng response |
-| Checkpoint | deployment/adapter/; trọng số epoch 5 và cấu hình đã cung cấp |
+| Checkpoint | deployment/adapter/; adapter Math-7B mới, không dùng adapter 3B cũ |
 | Cấu hình Mac | deployment/serving-mac.json |
 | Thông tin model | http://127.0.0.1:8000/v1/models |
 | API prediction | http://127.0.0.1:8001/predict |
@@ -36,7 +36,7 @@ cd /Users/nho/Documents/ChatGPT/VLSP/source-main
 bash deploy/start_mac.sh
 ```
 
-Script giữ máy thức bằng caffeinate trong lúc chạy. Lần đầu tải backbone Qwen đúng revision khoảng 6 GB vào Hugging Face cache, sau đó nạp LoRA. Không phải train lại, không lượng tử hóa, không đổi số token tối đa. Cấu hình Mac dành ngân sách bộ nhớ 65% và KV cache 512 MiB cho một request; max_model_len=4096, max_new_tokens=300 kế thừa run.
+Script giữ máy thức bằng caffeinate trong lúc chạy. Lần đầu tải backbone Math-7B đúng revision khoảng 15,2 GB vào Hugging Face cache, sau đó nạp LoRA mới đã train cho 7B. Không lượng tử hóa. max_model_len=4096; max_new_tokens kế thừa run (baseline 1000, sweep 300/1000). Ngân sách 65%/KV cache 512 MiB trước đây dành cho 3B; phải đánh giá và cấu hình lại trên Mac đủ RAM trước khi chạy 7B.
 
 Giữ Terminal này mở; Ctrl+C dừng API và model. Có thể dừng từ Terminal khác bằng `bash deploy/stop_mac.sh`. Để xem quá trình khởi động trong Terminal thứ hai:
 
@@ -51,7 +51,7 @@ curl http://127.0.0.1:8001/healthz
 curl http://127.0.0.1:8001/v1/models
 ```
 
-Chỉ khi /healthz trả status=ready thì API mới sẵn sàng. Model list phải có Qwen/Qwen2.5-3B-Instruct và Viper-Qwen2.5-3B-LoRA với parent là backbone.
+Chỉ khi /healthz trả status=ready thì API mới sẵn sàng. Model list phải có Qwen/Qwen2.5-Math-7B-Instruct và Viper-Qwen2.5-Math-7B-LoRA với parent là backbone.
 
 ## 3. Gọi prediction
 

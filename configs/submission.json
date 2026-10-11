@@ -1,8 +1,8 @@
 {
   "team_name": "Viper",
-  "base_model": "Qwen/Qwen2.5-3B-Instruct",
-  "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
-  "model_name": "Viper-Qwen2.5-3B-LoRA",
+  "base_model": "Qwen/Qwen2.5-Math-7B-Instruct",
+  "revision": "ef9926d75ab1d54532f6a30dd5e760355eb9aa4d",
+  "model_name": "Viper-Qwen2.5-Math-7B-LoRA",
   "adapter_path": null,
   "backend_url": "http://127.0.0.1:8000",
   "max_new_tokens": 300,
