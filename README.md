@@ -53,6 +53,48 @@ Launcher tự tạo 2 worker FSDP song song, một worker/GPU. Mỗi cấu hình
 !python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen25_3b_train_dev01
 ```
 
+## Thực nghiệm nhiều learning rate và giới hạn sinh
+
+`configs/sweep.json` đặt lưới **6 cấu hình**:
+
+| Learning rate | Weight decay | max_new_tokens |
+|---|---|---|
+| 1e-3 | 0.1 | 300, 1000 |
+| 1e-4 | 0.1 | 300, 1000 |
+| 2e-4 | 0.1 | 300, 1000 |
+
+```python
+!python -m baseline.sweep --output-dir /kaggle/working/vipra_lr_tokens01
+```
+
+Mỗi cấu hình train 5 epoch trên toàn bộ train và validation dev sau mỗi epoch, cùng seed 42;
+backbone/LoRA/optimizer/scheduler được tạo mới. **6 run tuần tự, tổng 30 epoch training**;
+mỗi run sử dụng hai GPU FSDP. Không khởi chạy 6 cấu hình cùng lúc, không retrain.
+`max_new_tokens` chỉ giới hạn output khi validation/inference; training vẫn học toàn bộ CoT tham chiếu,
+không cắt nhãn xuống 300 hoặc 1000 token. EOS hoặc deadline **60 giây/batch** có thể kết thúc generation
+trước giới hạn token; `unfinished_generation` ghi số câu chưa có EOS.
+
+Mỗi trial có thư mục riêng, `adapter/` lấy checkpoint tốt nhất của chính trial.
+`results.csv` xếp các trial hoàn tất theo điểm đáp án + đơn vị, exact, loss và epoch;
+`sweep.json` lưu cấu hình, trạng thái, checkpoint thắng toàn sweep và đường dẫn adapter.
+Bảng kết quả được cập nhật sau mỗi trial, kể cả khi một run lỗi.
+Bộ chạy dừng ngay khi lỗi; không tự chạy tiếp sau NCCL abort. Sau khi restart session,
+cập nhật repo và dùng cùng dữ liệu/cấu hình để tiếp tục:
+
+```python
+!python -m baseline.sweep --output-dir /kaggle/working/vipra_lr_tokens01 --resume
+```
+
+Resume bỏ qua trial hoàn tất, tạo thư mục attempt mới cho trial đang dở/lỗi và giữ log cũ.
+Nếu LR/grid/base config hoặc hash train/dev thay đổi thì phải dùng output mới.
+Đổi lưới qua `--grid-config <file.json>`; baseline đơn lẻ vẫn dùng `python -m baseline.experiment`.
+Notebook mặc định chạy sweep và hiển thị best trial, không tự đánh giá lại dev.
+
+Qwen2.5-3B-Instruct sinh lời giải trong `explanation` theo prompt của repo; không dùng thẻ `<think>`
+hay tùy chọn `enable_thinking` của các model có chế độ thinking. Nhãn training lấy `cot` vào
+`explanation` rồi `answer`/`unit`, học bằng teacher forcing. Validation model tự sinh lời giải và đáp án.
+Giới hạn token tính cho toàn bộ JSON; CoT dài có thể chiếm hết 300 token trước khi tới answer.
+
 ## Chạy song song và tái lập
 
 - `parallel_training="fsdp"` là mặc định, cần PyTorch CUDA **>= 2.8** và 2 GPU. `baseline.experiment` và `baseline.train` tự khởi chạy hai worker bằng torchrun; `baseline.parallel` là module worker.
@@ -104,6 +146,7 @@ evaluation/predictions.jsonl
 | `baseline/model.py` | Chia backbone FP16, LoRA và chunked loss |
 | `baseline/train.py` | Huấn luyện và lưu adapter |
 | `baseline/experiment.py` | Train 100% train, validation dev 5 epoch, xuất best checkpoint |
+| `baseline/sweep.py` | Chạy lưới LR/weight decay/token tuần tự; bảng kết quả và resume |
 | `baseline/parallel.py` | Launcher torchrun, FSDP2, chia batch, overflow/clipping và lưu adapter |
 | `baseline/parallel_check.py` | Preflight backend thật: Qwen nhỏ, gradient và optimizer đối chiếu reference |
 | `baseline/validation.py` | Chấm validation, sinh batch 4, xếp hạng checkpoint |

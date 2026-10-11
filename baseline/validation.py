@@ -55,7 +55,7 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
     result = {"seed": cfg["seed"], "epoch": epoch, "total": len(rows),
               "validation_loss": total_loss / total_tokens,
               "content_tolerant": 0, "content_exact": 0, "valid_json": 0,
-              "over_time": 0, "p1_estimate": 0}
+              "over_time": 0, "p1_estimate": 0, "unfinished_generation": 0}
     previous_cache = model.config.use_cache
     model.config.use_cache = True
     result.update(generation_batch_size=batch_size,
@@ -79,6 +79,7 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
                     result["content_exact"] += score["exact"]
                     result["valid_json"] += prediction is not None
                     result["over_time"] += over_time
+                    result["unfinished_generation"] += not finished
                     result["p1_estimate"] += score["tolerant"] and not over_time
                     if handle is not None:
                         handle.write(json.dumps({"query_id": row["id"], "prediction": prediction,

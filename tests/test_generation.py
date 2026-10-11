@@ -100,6 +100,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(calls, [["0", "1", "2", "3"], ["4"]])
             self.assertEqual(result["content_tolerant"], 5)
             self.assertEqual(result["generation_batch_size"], 4)
+            self.assertEqual(result["unfinished_generation"], 0)
             self.assertEqual([r["query_id"] for r in records], ["0", "1", "2", "3", "4"])
             self.assertEqual([r["generation_batch_size"] for r in records], [4, 4, 4, 4, 1])
             self.assertFalse(model.config.use_cache)
