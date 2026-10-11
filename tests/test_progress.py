@@ -58,3 +58,11 @@ class ProgressTests(unittest.TestCase):
                 progress.update(10)
             print_training_config({}, [])
         self.assertEqual(output.getvalue(), '')
+
+    def test_progress_with_extra_metrics(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch('baseline.progress.time.monotonic', return_value=100):
+            with BatchProgress('Validation loss', 3, log_every=1) as progress:
+                progress.update(1, extra='loss=1.5000 (batch=1.5000)')
+        self.assertIn('Validation loss | Batch 1/3 | Còn ~00:00:00 | loss=1.5000 (batch=1.5000)', output.getvalue())
+

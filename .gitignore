@@ -10,3 +10,8 @@ hf_cache/
 *.bin
 train_dataset.csv
 dev_dataset.csv
+deployment*/
+.venv-serving/
+.venv-api/
+deploy/.env
+output/

@@ -36,7 +36,7 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
     device = model.get_input_embeddings().weight.device
     total_loss, total_tokens = 0.0, 0
     with torch.no_grad(), BatchProgress(f"Validation loss epoch {epoch}", len(loader), enabled=primary,
-                                       log_every=cfg.get("log_every", 10)) as progress:
+                                       log_every=cfg.get("validation_log_every", 1)) as progress:
         for index, batch in enumerate(loader, start=1):
             batch = {key: value.to(device) for key, value in batch.items()}
             with torch.autocast(device.type, dtype=torch.float16):
@@ -47,9 +47,11 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
             if failed.item():
                 raise FloatingPointError(f"Validation loss không hữu hạn ở epoch {epoch}.")
             tokens = int(batch["labels"][:, 1:].ne(-100).sum())
-            total_loss += loss.item() * tokens
+            batch_loss = loss.item()
+            total_loss += batch_loss * tokens
             total_tokens += tokens
-            progress.update(index)
+            current_loss = total_loss / total_tokens if total_tokens else batch_loss
+            progress.update(index, extra=f"loss={current_loss:.4f} (batch={batch_loss:.4f})")
     if not total_tokens:
         raise ValueError("Validation không có token assistant.")
     result_dir = Path(result_dir)

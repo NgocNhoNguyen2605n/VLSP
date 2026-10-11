@@ -1,0 +1,4 @@
+# Đặt VIPRA_DOMAIN là tên miền đã trỏ DNS về máy GPU. Caddy tự cấp HTTPS.
+{$VIPRA_DOMAIN} {
+    reverse_proxy {$VIPRA_UPSTREAM:127.0.0.1:8001}
+}

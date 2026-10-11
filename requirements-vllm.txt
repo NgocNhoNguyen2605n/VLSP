@@ -1,0 +1,3 @@
+# Linux + NVIDIA GPU. Không cài vào môi trường training hiện tại.
+vllm==0.31.0
+-r requirements-serving.txt

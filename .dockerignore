@@ -1,0 +1,12 @@
+**
+!requirements-serving.txt
+!baseline/
+!baseline/**
+!submission/
+!submission/**
+!configs/
+!configs/**
+!deploy/
+!deploy/Dockerfile
+**/__pycache__/
+**/*.pyc

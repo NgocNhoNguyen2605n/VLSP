@@ -1,0 +1,4 @@
+query_id,query
+SMOKE_CAPACITOR,"Tính năng lượng điện trường tích trữ trong tụ có C = 100 μF và U = 30 V."
+SMOKE_MULTI,"Cho điện trở R = 10 Ω và hiệu điện thế U = 20 V. Tính cường độ dòng điện và công suất tiêu thụ, theo thứ tự."
+SMOKE_TEXT,"Nếu điện dung của tụ tăng gấp đôi trong khi điện tích không đổi, hiệu điện thế thay đổi thế nào?"

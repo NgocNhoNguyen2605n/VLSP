@@ -1,0 +1,38 @@
+services:
+  vipra:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - ../deployment:/deployment
+      - hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+    shm_size: "2gb"
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      VIPRA_DOMAIN: ${VIPRA_DOMAIN:?Điền VIPRA_DOMAIN vào deploy/.env}
+      VIPRA_UPSTREAM: vipra:8001
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    depends_on:
+      - vipra
+volumes:
+  hf-cache:
+  caddy-data:
+  caddy-config:

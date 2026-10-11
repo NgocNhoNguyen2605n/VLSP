@@ -4,6 +4,15 @@
 
 Repo dùng để khảo sát dữ liệu và xây dựng baseline fine-tuning LLM bằng Python.
 
+## Chuẩn bị nộp bài - đội Viper
+
+Đọc [hướng dẫn triển khai từng bước](SUBMISSION_GUIDE_VI.md) hoặc mở `03_submission.ipynb`.
+Mã trong `submission/` nối adapter đã train với vLLM và API BTC,
+xuất prediction từ public test, chuẩn bị notation và đóng gói `Viper.zip`.
+Chưa có adapter thì có thể chuẩn bị hồ sơ trước; inference thật cần checkpoint và backend GPU phù hợp.
+
+Mac Apple Silicon có đường serving riêng bằng vLLM Metal: đọc [MAC_SERVING_VI.md](MAC_SERVING_VI.md).
+
 ## Dữ liệu
 
 - Nguồn: **ViPPS**, phần `Physics_Dataset_no_image`, gồm các bài toán dạng văn bản về điện và từ.

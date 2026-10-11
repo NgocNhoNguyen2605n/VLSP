@@ -1,0 +1,15 @@
+{
+  "team_name": "Viper",
+  "base_model": "Qwen/Qwen2.5-3B-Instruct",
+  "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+  "model_name": "Viper-Qwen2.5-3B-LoRA",
+  "adapter_path": null,
+  "backend_url": "http://127.0.0.1:8000",
+  "max_new_tokens": 300,
+  "request_deadline_seconds": 55,
+  "seed": 42,
+  "max_model_len": 4096,
+  "gpu_memory_utilization": 0.85,
+  "log_dir": "outputs/serving",
+  "prepared": false
+}

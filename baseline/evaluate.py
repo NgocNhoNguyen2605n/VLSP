@@ -81,7 +81,7 @@ def generate_batch(model, tokenizer, questions, cfg):
     return results
 
 
-def evaluate(run_dir, result_dir=None, data_root=None):
+def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file=None):
     """Chấm mọi dòng dev; báo riêng content đúng và đúng trong giới hạn thời gian."""
     run_dir = Path(run_dir)
     if (run_dir / "experiment.json").is_file():
@@ -102,6 +102,10 @@ def evaluate(run_dir, result_dir=None, data_root=None):
     cfg = manifest["config"].copy()
     if data_root:
         cfg.update(data_root=data_root, train_file=None, dev_file=None)
+    if train_file is not None:
+        cfg["train_file"] = train_file
+    if dev_file is not None:
+        cfg["dev_file"] = dev_file
     setup_seed(cfg["seed"])
     result_dir = Path(result_dir) if result_dir else run_dir / "evaluation"
     if result_dir.exists() and any(result_dir.iterdir()):
@@ -174,8 +178,10 @@ def main():
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--result-dir")
     parser.add_argument("--data-root")
+    parser.add_argument("--train-file")
+    parser.add_argument("--dev-file")
     args = parser.parse_args()
-    evaluate(args.run_dir, args.result_dir, args.data_root)
+    evaluate(args.run_dir, args.result_dir, args.data_root, args.train_file, args.dev_file)
 
 
 if __name__ == "__main__":

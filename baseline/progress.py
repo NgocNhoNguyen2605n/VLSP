@@ -22,7 +22,7 @@ class BatchProgress:
         self.started_at, self.width = time.monotonic(), 0
         self.last_logged_at = self.started_at
 
-    def update(self, completed):
+    def update(self, completed, extra=None):
         if not self.enabled:
             return
         now = time.monotonic()
@@ -32,6 +32,8 @@ class BatchProgress:
         elapsed = max(0, now - self.started_at)
         eta = duration(elapsed / completed * (self.total - completed)) if completed else "--:--:--"
         line = f"{self.label} | Batch {completed}/{self.total} | {self.remaining_label} ~{eta}"
+        if extra:
+            line += f" | {extra}"
         if self.inline:
             print("\r" + line.ljust(self.width), end="", file=self.stream, flush=True)
             self.width = len(line)
