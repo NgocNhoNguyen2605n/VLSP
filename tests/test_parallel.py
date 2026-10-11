@@ -397,7 +397,7 @@ class ParallelTests(unittest.TestCase):
         self.assertLess(padded, sample(False, 1)[1] * .8)
 
     def test_two_rank_five_epochs_full_train_and_dev_validation(self):
-        self.run_train_dev(batch_size=1)
+        self.run_train_dev(batch_size=1, keep_unsharded=False)
 
     def test_two_rank_batch_four_variable_lengths_and_partial_batches(self):
         self.run_train_dev(batch_size=4)
@@ -405,7 +405,7 @@ class ParallelTests(unittest.TestCase):
     def test_tied_model_batch_four_dev_validation_and_adapter_reload(self):
         self.run_train_dev(batch_size=4, tied=True)
 
-    def run_train_dev(self, batch_size, tied=False):
+    def run_train_dev(self, batch_size, tied=False, keep_unsharded=True):
         import torch.multiprocessing as mp
         import torch
         from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -433,7 +433,8 @@ class ParallelTests(unittest.TestCase):
             cfg.update(model_id=str(root / 'backbone'), revision='local-test', data_root=str(root),
                        output_dir=str(root / 'search'), max_length=32, lora_rank=2, lora_alpha=4,
                        loss_chunk_size=2, batch_size=batch_size, gradient_accumulation_steps=4,
-                       max_new_tokens=2, timeout_seconds=600, training_stage='search')
+                       max_new_tokens=2, timeout_seconds=600, training_stage='search',
+                       checkpoint_selection='answer_accuracy', validation_keep_unsharded=keep_unsharded)
             splits, info = load_data(cfg)
             split_path = root / 'split.json'
             save_json(split_path, validation_manifest(splits, info))
@@ -446,6 +447,7 @@ class ParallelTests(unittest.TestCase):
             self.assertEqual(search['config']['epochs'], 5)
             self.assertEqual(search['best_checkpoint']['epoch'], 3)
             self.assertEqual(search['best_checkpoint']['total'], validation_count)
+            self.assertEqual(search['best_checkpoint']['generation_keep_unsharded'], keep_unsharded)
             self.assertEqual(search['model']['parallelism'], 'FSDP2')
             self.assertEqual(search['model']['world_size'], 2)
             self.assertEqual(search['training_status'], 'complete')

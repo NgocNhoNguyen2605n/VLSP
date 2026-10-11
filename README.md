@@ -42,6 +42,26 @@ Sau khi clone repo về chạy lần lượt:
 
 ## Train đầy đủ, validation trên dev, lưu best checkpoint
 
+Mặc định mới: `checkpoint_selection="fixed_epoch"`, `selected_epoch=5`, `epochs=5`.
+Sau mỗi epoch chỉ tính dev loss (forward trên lời giải chuẩn), không sinh CoT/đáp án và không báo accuracy.
+Adapter xuất ra lấy đúng checkpoint epoch 5; dev loss không thay đổi epoch đã chọn.
+Đổi `selected_epoch` trong khoảng 1..`epochs` để lấy epoch khác. Các checkpoint từng epoch vẫn được lưu.
+Sweep so sánh dev loss tại epoch cố định; muốn đo accuracy, gọi evaluate riêng sau khi chọn cấu hình.
+Chế độ cũ bên dưới chỉ áp dụng khi đặt `checkpoint_selection="answer_accuracy"`.
+
+Khi sinh đáp án validation bằng FSDP2, `validation_keep_unsharded=true` (mặc định)
+giữ trọng số backbone đầy đủ trên mỗi GPU trong toàn bộ vòng generation.
+Batch đầu vẫn gom trọng số và thời gian này nằm trong timer; các token/batch sau dùng lại
+trọng số, tránh all-gather mỗi token. Dev loss vẫn chạy với sharding thông thường.
+Sau generation, kể cả khi có exception, code reshard từng module và khôi phục policy
+training (root=False, embedding/decoder=True). KV cache, greedy, prompt và adapter giữ cùng cấu hình.
+`generation_keep_unsharded` trong metrics ghi nhận chế độ đã dùng.
+Chế độ này tăng VRAM: khoảng 5,75 GiB trọng số đầy đủ/GPU, còn cần chỗ cho shard/buffer,
+LoRA/optimizer, KV cache và activation. Cần đo peak VRAM/tốc độ trên T4;
+nếu thiếu VRAM, đặt `validation_keep_unsharded=false` để dùng đường generation cũ.
+Với `fixed_epoch`, chỉ tính loss nên không vào chế độ giữ trọng số generation.
+Lệnh evaluate riêng dùng model chia lớp trong một tiến trình, không dùng FSDP2.
+
 1. Dùng toàn bộ **677 mẫu train** trong `train_dataset.csv` để học. **339 mẫu `dev_dataset.csv`** dùng validation; không chia lại train, không đưa dev vào optimizer. `split.json` chỉ ghi hash và ID của hai CSV riêng để worker kiểm tra đúng dữ liệu.
 2. Khởi tạo backbone gốc + LoRA mới, train **5 epoch với seed 42**. Sau mỗi epoch, tính dev loss và sinh greedy theo batch 4 (`validation_batch_size=4`), lưu checkpoint + predictions + metrics. Dev 339 câu có **85 batch generation/epoch** (batch cuối 3 câu). Hai rank cùng xử lý một batch 4 câu, không phải 4 câu riêng/GPU.
 3. Chọn epoch theo **content_tolerant accuracy** (đáp án + đơn vị). Nếu hòa: content_exact cao hơn, dev loss thấp hơn, epoch sớm hơn. Không dùng timeout để xếp hạng. Dung sai mặc định `rtol=0.05, atol=0` (5% theo đáp án chuẩn).

@@ -25,7 +25,7 @@ class SweepTests(unittest.TestCase):
                 writer.writerows({"id": str(i), "question": f"{name} {i}", "cot": "Giải",
                                   "answer": "1", "unit": "V"} for i in range(count))
         cfg = json.loads(Path("configs/baseline.json").read_text())
-        cfg.update(data_root=str(root), output_dir=str(root / "sweep"))
+        cfg.update(data_root=str(root), output_dir=str(root / "sweep"), checkpoint_selection="answer_accuracy")
         return cfg
 
     def runner(self, calls, failure=None):

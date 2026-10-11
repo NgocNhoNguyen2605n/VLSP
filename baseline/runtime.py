@@ -44,6 +44,16 @@ def read_config(args):
     if cfg["rtol"] < 0 or cfg["atol"] < 0:
         raise ValueError("Dung sai không được âm.")
     cfg.setdefault("validation_batch_size", 4)
+    if type(cfg.get("validation_keep_unsharded", True)) is not bool:
+        raise ValueError("validation_keep_unsharded phải là boolean.")
+    selection = cfg.get("checkpoint_selection", "answer_accuracy")
+    if selection not in ("fixed_epoch", "answer_accuracy"):
+        raise ValueError("checkpoint_selection phải là fixed_epoch hoặc answer_accuracy.")
+    if selection == "fixed_epoch":
+        selected = cfg.get("selected_epoch", cfg["epochs"])
+        if type(selected) is not int or not 1 <= selected <= cfg["epochs"]:
+            raise ValueError("selected_epoch phải nằm trong [1, epochs].")
+        cfg["selected_epoch"] = selected
     if type(cfg["validation_batch_size"]) is not int or cfg["validation_batch_size"] <= 0:
         raise ValueError("validation_batch_size phải là số nguyên dương.")
     if not 0 < cfg.get("fp16_init_scale", 128.0) < float("inf"):
@@ -85,10 +95,12 @@ def print_training_config(cfg, target_modules, world_size=1):
     if stage == "search":
         lines.extend([
             "Dữ liệu: toàn bộ train_dataset.csv | validation=dev_dataset.csv | "
-            "chọn best epoch theo validation answer+unit accuracy | không retrain",
+            f"checkpoint_selection={cfg.get('checkpoint_selection', 'answer_accuracy')} | không retrain",
             f"Validation: greedy | generation batch={cfg.get('validation_batch_size', 4)} | max_new_tokens={cfg['max_new_tokens']} | "
             f"timeout_seconds={cfg['timeout_seconds']} | rtol={cfg['rtol']:g} | atol={cfg['atol']:g}",
         ])
+        if cfg.get("checkpoint_selection") == "fixed_epoch":
+            lines.append(f"Checkpoint epoch cố định={cfg['selected_epoch']} | chỉ dev loss, không sinh đáp án")
     elif stage == "final":
         lines.append("Retrain: toàn bộ train + validation, backbone gốc + LoRA mới, optimizer/scheduler mới.")
     print("\n".join(lines), flush=True)

@@ -29,6 +29,27 @@ class Tokenizer:
 class GenerationTests(unittest.TestCase):
     cfg = {"gpu_count": 2, "max_new_tokens": 4, "timeout_seconds": 60}
 
+    def test_fixed_epoch_validation_never_generates_or_reports_accuracy(self):
+        model = SimpleNamespace(config=SimpleNamespace(use_cache=False),
+                                get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1)))
+        class Learner:
+            def eval(self): pass
+            def __call__(self, **kwargs): return torch.tensor(2.)
+        learner = Learner()
+        learner.model = model
+        cfg = {**self.cfg, "seed": 42, "checkpoint_selection": "fixed_epoch", "selected_epoch": 3}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("baseline.validation.generate_batch") as generate, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = validate_epoch(learner, [{"labels": torch.tensor([[-100, 1]])}],
+                                    [{"id": "dev"}], None, cfg, 3, directory)
+            generate.assert_not_called()
+            self.assertFalse((Path(directory) / "predictions.jsonl").exists())
+            self.assertEqual(result["validation_loss"], 2.)
+            self.assertNotIn("content_tolerant", result)
+            self.assertFalse(result["generation_performed"])
+            self.assertFalse(model.config.use_cache)
+
     def test_left_padding_and_each_eos_without_counting_trailing_padding(self):
         model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=64),
                                 get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1)))

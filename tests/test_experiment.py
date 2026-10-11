@@ -13,6 +13,11 @@ from baseline.validation import checkpoint_rank
 
 
 class SplitTests(unittest.TestCase):
+    def test_fixed_epoch_wins_even_when_another_epoch_has_lower_loss(self):
+        base = {"total": 10, "validation_loss": 2., "epoch": 3,
+                "checkpoint_selection": "fixed_epoch", "selected_epoch": 3}
+        self.assertGreater(checkpoint_rank(base), checkpoint_rank({**base, "epoch": 5, "validation_loss": .1}))
+
     @staticmethod
     def rows(count=100):
         return [{"id": str(i), "question": f"Câu hỏi {i}", "cot": "Giải", "answer": "1", "unit": "V"}
@@ -29,6 +34,39 @@ class SplitTests(unittest.TestCase):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_fixed_epoch_exports_requested_weights_without_accuracy_metrics(self):
+        from baseline.experiment import run_experiment
+        from baseline.data import load_training_data
+        from baseline.runtime import save_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for split in ("train", "dev"):
+                with (root / f"{split}_dataset.csv").open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=["id", "question", "cot", "answer", "unit"])
+                    writer.writeheader()
+                    writer.writerows(SplitTests.rows(2))
+            cfg = json.loads(Path("configs/baseline.json").read_text())
+            cfg.update(data_root=str(root), output_dir=str(root / "run"), selected_epoch=3)
+            def runner(path):
+                worker = json.loads(Path(path).read_text())
+                rows, dev, info, split = load_training_data(worker)
+                output = Path(worker["output_dir"])
+                history = []
+                for epoch in range(1, 6):
+                    save_json(output / f"epoch-{epoch}" / "adapter_config.json", {})
+                    (output / f"epoch-{epoch}" / "adapter_model.safetensors").write_bytes(str(epoch).encode())
+                    history.append({"validation": {"epoch": epoch, "seed": 42, "total": len(dev),
+                                                    "validation_loss": 1. / epoch}})
+                save_json(output / "train_log.json", history)
+                save_json(output / "run.json", {"config": worker, "data": info, "split": split,
+                                               "training_status": "complete", "training_samples": len(rows)})
+                save_json(output / "adapter" / "tokenizer_config.json", {})
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = run_experiment(cfg, runner=runner)
+            self.assertEqual(result["best_checkpoint"]["epoch"], 3)
+            self.assertEqual((root / "run/adapter/adapter_model.safetensors").read_bytes(), b"3")
+            self.assertNotIn("content_tolerant", result["best_checkpoint"])
+
     def test_worker_uses_all_train_and_only_dev_for_validation_and_checks_both_csvs(self):
         from baseline.data import load_data, load_training_data, validation_manifest
         from baseline.runtime import save_json
@@ -226,6 +264,7 @@ class ExperimentTests(unittest.TestCase):
                 writer.writerows(dev_rows)
             cfg = json.loads(Path("configs/baseline.json").read_text())
             cfg.update(model_id=str(root / "backbone"), revision="local-test", data_root=str(root),
+                       checkpoint_selection="answer_accuracy", skip_missing_answer=True,
                        output_dir=str(root / "experiment"), max_length=32, lora_rank=2, lora_alpha=4,
                        loss_chunk_size=3, batch_size=3, gradient_accumulation_steps=2)
             calls, initialized = [], []

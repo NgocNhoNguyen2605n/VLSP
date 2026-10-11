@@ -119,7 +119,7 @@ def run_sweep(cfg, grid, runner=None, resume=False):
     save_results(output, manifest)
     best = manifest["best_trial"]
     print(f"Sweep hoàn tất: {len(params)} cấu hình. Best: {best['name']} | "
-          f"epoch={best['best']['epoch']} | đúng dev={best['best']['content_tolerant']}/{best['best']['total']} | "
+          f"epoch={best['best']['epoch']} | dev loss={best['best']['validation_loss']:.4f} | "
           f"adapter={Path(best['run_dir']) / 'adapter'}", flush=True)
     return manifest
 

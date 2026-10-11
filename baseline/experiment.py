@@ -31,11 +31,16 @@ def run_experiment(cfg, runner=None):
     cfg.pop("split_seed", None)
     cfg.pop("validation_fraction", None)
     cfg.setdefault("validation_batch_size", 4)
+    fixed = cfg.get("checkpoint_selection") == "fixed_epoch"
     seed = cfg["seed"]
     if type(seed) is not int or not 0 <= seed < 2**32:
         raise ValueError("seed phải là số nguyên trong [0, 2**32).")
     if type(cfg["epochs"]) is not int or cfg["epochs"] <= 0:
         raise ValueError("epochs phải là số nguyên dương.")
+    if fixed:
+        cfg.setdefault("selected_epoch", cfg["epochs"])
+        if type(cfg["selected_epoch"]) is not int or not 1 <= cfg["selected_epoch"] <= cfg["epochs"]:
+            raise ValueError("selected_epoch phải nằm trong [1, epochs].")
     output = Path(cfg["output_dir"]).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"{output} đã có dữ liệu; hãy chọn --output-dir mới.")
@@ -46,7 +51,8 @@ def run_experiment(cfg, runner=None):
     save_json(split_path, split)
     manifest = {"status": "running", "workflow": "train_dev", "config": cfg, "data": data_info, "split": split,
                 "search_seed": seed, "search_epochs": cfg["epochs"], "completed_epochs": [],
-                "selection": "max validation content_tolerant accuracy, then exact, min loss, earlier epoch",
+                "selection": (f"fixed epoch {cfg['selected_epoch']}; no answer generation"
+                              if fixed else "max validation content_tolerant accuracy, then exact, min loss, earlier epoch"),
                 "initialization": "fresh backbone + fresh LoRA; no retraining",
                 "best_adapter_dir": str(output / "adapter")}
     save_json(output / "experiment.json", manifest)
@@ -83,6 +89,8 @@ def run_experiment(cfg, runner=None):
             if not (checkpoint / "adapter_config.json").is_file():
                 raise RuntimeError(f"Thiếu checkpoint {checkpoint}.")
             candidate.update(checkpoint=str(checkpoint), config_file=str(config_path))
+            if fixed:
+                candidate.update(checkpoint_selection="fixed_epoch", selected_epoch=cfg["selected_epoch"])
             candidates.append(candidate)
             if best is None or checkpoint_rank(candidate) > checkpoint_rank(best):
                 best = candidate.copy()
@@ -105,7 +113,9 @@ def run_experiment(cfg, runner=None):
                                        "adapter_checkpoint": best["checkpoint"], "best_checkpoint": best})
         manifest["status"] = "complete"
         save_json(output / "experiment.json", manifest)
-        print(f"Best: epoch={best['epoch']}, đúng dev={best['content_tolerant']}/{best['total']}. "
+        detail = ("epoch cố định; không sinh đáp án dev" if fixed
+                  else f"đúng dev={best['content_tolerant']}/{best['total']}")
+        print(f"Checkpoint: epoch={best['epoch']}, {detail}. "
               f"Adapter: {adapter}. Không retrain.", flush=True)
         return manifest
     except Exception as error:

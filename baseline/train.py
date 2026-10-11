@@ -87,7 +87,7 @@ def train(cfg):
                 "effective_batch_size": cfg["batch_size"] * accumulation,
                 "training_stage": stage, "training_samples": len(training_rows), "split": split_info,
                 "initialization": "backbone gốc và adapter LoRA mới; không nạp checkpoint search",
-                "selection": "validation answer+unit accuracy" if stage == "search" else "final epoch",
+                "selection": cfg.get("checkpoint_selection", "answer_accuracy") if stage == "search" else "final epoch",
                 "training_status": "running"}
     save_json(output / "run.json", manifest)
     best = None
@@ -160,7 +160,7 @@ def train(cfg):
                 best = result.copy()
                 save_json(output / "best_checkpoint.json", best)
             if verbose:
-                print(f"Epoch {epoch}: validation đúng={result['content_tolerant']}/{result['total']} | "
+                print(f"Epoch {epoch}: validation loss={result['validation_loss']:.4f} | "
                       f"loss={result['validation_loss']:.4f} | best epoch={best['epoch']}", flush=True)
         save_json(output / "train_log.json", history)
         if verbose:
@@ -179,7 +179,7 @@ def main():
     if "training_stage" not in cfg:
         # Notebook cũ gọi train trực tiếp vẫn phải chạy quy trình chọn best epoch.
         from .experiment import run_experiment
-        print("Train mặc định: 100% train, validation trên dev; lưu best epoch, không retrain.", flush=True)
+        print(f"Train: 100% train, dev validation | chọn checkpoint={cfg.get('checkpoint_selection', 'answer_accuracy')} | không retrain.", flush=True)
         run_experiment(cfg)
         return
     if cfg.get("parallel_training") == "fsdp":

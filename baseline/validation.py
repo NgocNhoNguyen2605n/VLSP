@@ -19,11 +19,14 @@ def checkpoint_rank(result):
     loss = result["validation_loss"]
     if total <= 0 or not math.isfinite(loss):
         raise ValueError("Checkpoint thiếu validation hợp lệ.")
+    if result.get("checkpoint_selection") == "fixed_epoch":
+        return (int(result["epoch"] == result["selected_epoch"]), -loss, -result["epoch"])
     return (result["content_tolerant"] / total, result["content_exact"] / total,
             -loss, -result["epoch"])
 
 
-def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, primary=True):
+def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, primary=True,
+                   generation_context=None):
     """Loss có trọng số token; sinh một lần mỗi câu và so đáp án + đơn vị."""
     batch_size = cfg.get("validation_batch_size", 4)
     if type(batch_size) is not int or batch_size <= 0:
@@ -56,6 +59,16 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
               "validation_loss": total_loss / total_tokens,
               "content_tolerant": 0, "content_exact": 0, "valid_json": 0,
               "over_time": 0, "p1_estimate": 0, "unfinished_generation": 0}
+    if cfg.get("checkpoint_selection") == "fixed_epoch":
+        result = {"seed": cfg["seed"], "epoch": epoch, "total": len(rows),
+                  "validation_loss": total_loss / total_tokens,
+                  "checkpoint_selection": "fixed_epoch",
+                  "selected_epoch": cfg["selected_epoch"],
+                  "generation_performed": False,
+                  "selection_metric": "fixed epoch; validation loss is diagnostic only"}
+        if primary:
+            save_json(result_dir / "metrics.json", result)
+        return result
     previous_cache = model.config.use_cache
     model.config.use_cache = True
     result.update(generation_batch_size=batch_size,
@@ -64,8 +77,10 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
         handle_context = ((result_dir / "predictions.jsonl").open("w", encoding="utf-8")
                           if primary else contextlib.nullcontext(None))
         # Hai rank phải cùng sinh đúng batch, kể cả batch cuối thiếu 4 câu.
-        with handle_context as handle, BatchProgress(f"Validation đáp án epoch {epoch}", math.ceil(len(rows) / batch_size), enabled=primary,
+        with (generation_context or contextlib.nullcontext(False)) as retained, \
+             handle_context as handle, BatchProgress(f"Validation đáp án epoch {epoch}", math.ceil(len(rows) / batch_size), enabled=primary,
                                                      log_every=cfg.get("log_every", 10)) as progress:
+            result["generation_keep_unsharded"] = bool(retained)
             for index, start in enumerate(range(0, len(rows), batch_size), start=1):
                 batch_rows = rows[start:start + batch_size]
                 outputs = generate_batch(model, tokenizer, [row["question"] for row in batch_rows], cfg)

@@ -2,6 +2,7 @@
 
 from .runtime import arguments, environment, print_training_config, read_config, save_json, setup_seed
 
+import contextlib
 import gc
 import hashlib
 import json
@@ -19,7 +20,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, get_cosine_schedule_with_warmup
@@ -154,6 +155,30 @@ def finish_device_work(device):
     """Hoàn tất mọi stream FSDP trước khi gọi collective của pha kế tiếp."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+@contextlib.contextmanager
+def unsharded_validation_generation(root, device):
+    """Giữ backbone đầy đủ qua mọi batch generation, rồi trả về policy của shard_model."""
+    # shard_model đặt root=False, embedding/decoder=True. Không dùng API nội bộ FSDP.
+    policies = [(root, False)] + [(module, True) for module in root.modules()
+                                  if module is not root and isinstance(module, FSDPModule)]
+    def restore(module, original):
+        try:
+            module.reshard()  # API này không recursive: giải phóng từng module.
+        finally:
+            module.set_reshard_after_forward(original, recurse=False)
+
+    finish_device_work(device)
+    with contextlib.ExitStack() as cleanup:
+        for module, original in policies:
+            cleanup.callback(restore, module, original)
+            module.set_reshard_after_forward(False, recurse=False)
+        # ExitStack vẫn chạy mọi callback nếu synchronize/cleanup có exception.
+        cleanup.callback(finish_device_work, device)
+        # Forward đầu tiên vẫn all-gather và được tính trong thời gian generation.
+        # Các token/batch sau dùng lại trọng số, không gọi unshard riêng trước timer.
+        yield True
 
 
 def synchronize_adapter_gradients(params, device, bucket_bytes=8 * 1024**2):
@@ -336,7 +361,7 @@ def train_parallel(cfg, device):
                 "training_samples": len(rows), "split": split,
                 "group_by_length": cfg.get("group_by_length", False),
                 "initialization": "backbone gốc và LoRA mới; không nạp checkpoint search",
-                "selection": "validation answer+unit accuracy" if validation else "final epoch",
+                "selection": cfg.get("checkpoint_selection", "answer_accuracy") if validation else "final epoch",
                 "training_status": "running"}
     primary_action(lambda: save_json(output / "run.json", manifest))
     progress = {"rank": rank, "device": str(device), "training_stage": stage}
@@ -419,8 +444,11 @@ def train_parallel(cfg, device):
             if validation:
                 # FSDP collectives yêu cầu mọi rank tham gia generation; synced_gpus xử lý EOS/deadline khác nhau.
                 mark("validation")
+                generation_context = (unsharded_validation_generation(root, device)
+                                      if cfg.get("validation_keep_unsharded", True) else None)
                 result = validate_epoch(learner, validation_loader, validation, tokenizer, cfg, epoch,
-                                        output / "validation" / f"epoch-{epoch}", primary=primary)
+                                        output / "validation" / f"epoch-{epoch}", primary=primary,
+                                        generation_context=generation_context)
                 result = primary_action(lambda: result)
                 result["checkpoint"] = str(checkpoint.resolve())
                 record["validation"] = result
@@ -431,7 +459,7 @@ def train_parallel(cfg, device):
             primary_action(lambda: save_json(output / "train_log.json", history))
             if primary and verbose:
                 print(f"Epoch {epoch} hoàn tất | loss={record['loss']:.4f}" +
-                      (f" | đúng={result['content_tolerant']}/{result['total']} | best epoch={best['epoch']}" if validation else ""), flush=True)
+                      (f" | dev loss={result['validation_loss']:.4f} | checkpoint epoch={best['epoch']}" if validation else ""), flush=True)
         save_adapter(model, tokenizer, output / "adapter", include_tokenizer=True)
         manifest.update(training_status="complete", successful_optimizer_steps=successful,
                         skipped_optimizer_steps=skipped_steps, best_checkpoint=best)
