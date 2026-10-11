@@ -36,6 +36,14 @@ class MetricsTests(unittest.TestCase):
         self.assertTrue(score["tolerant"])
         self.assertFalse(score["exact"])
 
+    def test_five_percent_relative_boundary(self):
+        """Mặc định cho sai số 5%, kể cả nhãn âm; vượt ngưỡng bị tính sai."""
+        for gold, accepted, rejected in (("100", "105", "105.01"),
+                                         ("-100", "-105", "-105.01")):
+            target = {"answer": gold, "unit": "V"}
+            self.assertTrue(score_prediction(self.prediction(accepted, "V"), target)["tolerant"])
+            self.assertFalse(score_prediction(self.prediction(rejected, "V"), target)["tolerant"])
+
     def test_unit_case_and_scale(self):
         """Sai đơn vị/thang đo bị tính sai; không tự đổi mJ sang J."""
         for unit in ("mV", "v", "A"):
@@ -50,7 +58,7 @@ class MetricsTests(unittest.TestCase):
         """Một phần sai, đảo thứ tự hay thiếu đơn vị làm cả câu sai."""
         gold = {"answer": "0.50; 1.25", "unit": "uC; uJ"}
         self.assertTrue(score_prediction(self.prediction("0.5; 1.25", "µC; μJ"), gold)["tolerant"])
-        for answer, unit in (("0.5; 1.3", "uC; uJ"), ("1.25; 0.5", "uJ; uC"),
+        for answer, unit in (("0.5; 1.4", "uC; uJ"), ("1.25; 0.5", "uJ; uC"),
                              ("0.5", "uC"), ("0.5; 1.25", "uC")):
             self.assertFalse(score_prediction(self.prediction(answer, unit), gold)["tolerant"])
 

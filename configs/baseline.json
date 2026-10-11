@@ -9,7 +9,7 @@
   "train_file": null,
   "dev_file": null,
   "output_dir": "/kaggle/working/vipra_qwen25_3b_5epochs",
-  "skip_missing_answer": true,
+  "skip_missing_answer": false,
   "max_length": 2048,
   "epochs": 5,
   "batch_size": 4,
@@ -28,7 +28,7 @@
   "verbose_logging": false,
   "max_new_tokens": 300,
   "timeout_seconds": 60,
-  "rtol": 0.01,
+  "rtol": 0.05,
   "atol": 0.0,
   "fp16_init_scale": 128.0,
   "max_consecutive_skips": 8

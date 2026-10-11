@@ -5,7 +5,7 @@ from .runtime import environment, save_json, setup_seed  # Seed, môi trường 
 import argparse  # Chọn thư mục adapter và kết quả.
 import hashlib  # Kiểm tra template giống lúc train.
 import json  # Lưu từng prediction ngay sau khi sinh.
-import time  # Đo thời gian mỗi câu theo giới hạn 60 giây.
+import time  # Đo thời gian mỗi câu theo deadline generation trong cấu hình (60 giây mặc định).
 from pathlib import Path  # Đọc manifest và lưu JSONL.
 
 import torch  # Inference không gradient, dùng FP16 trên hai GPU.

@@ -87,7 +87,7 @@ class GenerationTests(unittest.TestCase):
         learner.model = model
         rows = [{"id": str(i), "question": str(i), "answer": str(i), "unit": "V"} for i in range(5)]
         loader = [{"labels": torch.tensor([[-100, 1]])}]
-        cfg = {**self.cfg, "seed": 42, "validation_batch_size": 4, "rtol": .01, "atol": 0}
+        cfg = {**self.cfg, "seed": 42, "validation_batch_size": 4, "rtol": .05, "atol": 0}
         calls = []
         def generation(model, tokenizer, questions, config):
             calls.append(questions)

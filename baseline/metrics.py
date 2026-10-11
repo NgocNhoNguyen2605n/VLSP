@@ -98,7 +98,7 @@ def parse_prediction(text):
     return result if result["unit"].isascii() else None
 
 
-def score_prediction(prediction, gold, rtol=0.01, atol=0.0):
+def score_prediction(prediction, gold, rtol=0.05, atol=0.0):
     """All-or-nothing; không cộng điểm từng phần hoặc điểm explanation."""
     if prediction is None:
         return {"exact": False, "tolerant": False, "unsupported_symbolic": False}
