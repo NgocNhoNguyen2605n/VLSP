@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from baseline.consistency import decoding_settings
+
 BASE_MODEL = "Qwen/Qwen2.5-Math-7B-Instruct"
 REVISION = "ef9926d75ab1d54532f6a30dd5e760355eb9aa4d"
 BASE_PARAMETERS = 7_615_616_512
@@ -27,6 +29,9 @@ class ServingConfig:
     max_new_tokens: int = 300
     request_deadline_seconds: float = 55
     seed: int = 42
+    self_consistency_samples: int = 5
+    sampling_temperature: float = 0.7
+    sampling_top_p: float = 0.8
     max_model_len: int = 4096
     gpu_memory_utilization: float = .85
     log_dir: str = "outputs/serving"
@@ -36,6 +41,7 @@ class ServingConfig:
     backbone_precision: str = "float16"
 
     def __post_init__(self):
+        decoding_settings(self)
         expected = SUPPORTED_BACKBONES.get(self.base_model)
         if expected is None or self.revision != expected[0]:
             raise ValueError("Backbone/revision serving chưa được khai báo hoặc không khớp checkpoint.")

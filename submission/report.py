@@ -7,6 +7,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from .config import BASE_MODEL, BASE_PARAMETERS
+from baseline.consistency import decoding_settings
 
 
 def create_report(train_file, dev_file, output, deployment=None, font=None, bold_font=None):
@@ -78,7 +79,12 @@ def create_report(train_file, dev_file, output, deployment=None, font=None, bold
     add(f"{model_id.split('/')[-1]} uses its official chat template. Supervised fine-tuning maps each question to one JSON object containing explanation, answer, unit and reasoning=null. Teacher forcing learns only assistant tokens. Training uses FP16 frozen backbone, FP32 LoRA, seed {cfg['seed']} and {cfg['epochs']} epochs; FSDP2 distributes training across GPUs. The exported adapter is epoch {epoch} ({escape(str(cfg.get('checkpoint_selection', 'answer_accuracy')))} selection).")
     precision = ("The backbone is converted from the pinned revision to MLX affine 4-bit (group size 64); LoRA is applied separately through vLLM Metal on Apple Silicon. "
                  if provenance and provenance.get("inference_precision") == "mlx-4bit" else "")
-    add(f"Inference runs one self-hosted vLLM engine with the selected LoRA. {precision}The training prompt is retained; greedy decoding generates explanation and answer in one call, at most {cfg['max_new_tokens']} new tokens. The API attaches the original query_id, normalizes units to ASCII, and returns a one-element JSON list. Multipart answers and units use '; ' in matching order. No answer labels, retrieval, external solver or third-party inference API are used at prediction time.")
+    serving = json.loads((Path(deployment) / "serving.json").read_text()) if deployment else cfg
+    settings = decoding_settings({"self_consistency_samples": 5, **serving})
+    decoding = (f"self-consistency samples {settings['samples']} explanations in one call "
+                f"(temperature={settings['temperature']:g}, top_p={settings['top_p']:g}) and votes on normalized answer/unit tuples; ties use the first candidate"
+                if settings["samples"] > 1 else "greedy decoding generates one explanation and answer")
+    add(f"Inference runs one self-hosted vLLM engine with the selected LoRA. {precision}The official chat template is retained; {decoding}, at most {serving['max_new_tokens']} new tokens per sample. The API attaches query_id, normalizes units to ASCII, and returns one JSON result. No answer labels, retrieval, external solver or third-party inference API are used at prediction time.")
     add("3. Models and capacity", "head")
     # Qwen2.5-Math-7B: 28 lớp, tổng (in + out) của 7 projection/lớp = 90,112.
     adapter = provenance["adapter_parameters"] if provenance else cfg["lora_rank"] * 28 * 90_112

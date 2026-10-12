@@ -5,7 +5,16 @@ import os
 import httpx
 
 from baseline.data import prompt_messages
+from baseline.consistency import decoding_settings, select_consistent
 from .schema import competition_result
+
+
+class ModelOutputError(ValueError):
+    """Giữ đầu ra model để log khi kiểm tra định dạng thất bại."""
+
+    def __init__(self, message, details):
+        super().__init__(message)
+        self.details = details
 
 
 class VLLMBackend:
@@ -37,17 +46,42 @@ class VLLMBackend:
 
     async def predict(self, query):
         cfg = self.config
+        decoding = decoding_settings(cfg)
         response = await self.client.post("/v1/chat/completions", json={
             "model": cfg.model_name, "messages": prompt_messages(query.query),
-            "max_tokens": cfg.max_new_tokens, "temperature": 0, "top_p": 1,
+            "max_tokens": cfg.max_new_tokens, "temperature": decoding["temperature"], "top_p": decoding["top_p"],
             "top_k": -1, "repetition_penalty": 1, "seed": cfg.seed,
-            "n": 1, "stream": False})
+            "n": decoding["samples"], "stream": False})
         response.raise_for_status()
         body = response.json()
-        choice = body["choices"][0]
+        choices = body["choices"]
+        details = {"usage": body.get("usage", {}), "decoding": decoding}
+        if not isinstance(choices, list) or len(choices) != decoding["samples"]:
+            raise ModelOutputError("vLLM không trả đủ số mẫu yêu cầu.", details)
+        if any(not isinstance(choice, dict) or not isinstance(choice.get("message"), dict) for choice in choices):
+            raise ModelOutputError("vLLM trả choices sai schema.", details)
+        if decoding["samples"] > 1:
+            # vLLM có thể trả choices không theo thứ tự; index quyết định cách xử lý hòa.
+            indices = [choice.get("index") for choice in choices]
+            if sorted(index for index in indices if type(index) is int) != list(range(len(choices))):
+                raise ModelOutputError("vLLM trả index mẫu trùng hoặc không hợp lệ.", details)
+            choices = sorted(choices, key=lambda choice: choice["index"])
+            candidates = [{"raw_output": choice.get("message", {}).get("content"),
+                           "finished": choice.get("finish_reason") == "stop",
+                           "finish_reason": choice.get("finish_reason")} for choice in choices]
+            selected, consistency = select_consistent(candidates)
+            details["self_consistency"] = consistency
+            if selected is None:
+                raise ModelOutputError("Không có mẫu hoàn tất và hợp lệ trong self-consistency.", details)
+            choice = choices[selected]
+        else:
+            choice = choices[0]
         raw = choice["message"]["content"]
+        details.update(raw_output=raw, finish_reason=choice.get("finish_reason"))
         if not isinstance(raw, str):
-            raise ValueError("vLLM trả content không phải chuỗi.")
-        result = competition_result(query.query_id, raw)
-        return result, {"raw_output": raw, "finish_reason": choice.get("finish_reason"),
-                        "usage": body.get("usage", {})}
+            raise ModelOutputError("vLLM trả content không phải chuỗi.", details)
+        try:
+            result = competition_result(query.query_id, raw)
+        except (ValueError, KeyError, IndexError, TypeError) as error:
+            raise ModelOutputError(str(error), details) from error
+        return result, details

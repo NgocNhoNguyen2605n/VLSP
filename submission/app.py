@@ -11,9 +11,10 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException
 
-from .backend import VLLMBackend
+from .backend import ModelOutputError, VLLMBackend
 from .config import ServingConfig
 from .schema import Query
+from baseline.consistency import decoding_settings
 
 
 def create_app(config=None, backend=None):
@@ -50,7 +51,7 @@ def create_app(config=None, backend=None):
     async def health():
         await models()
         return {"status": "ready", "model": cfg.model_name, "team": cfg.team_name,
-                "backbone_precision": cfg.backbone_precision}
+                "backbone_precision": cfg.backbone_precision, "decoding": decoding_settings(cfg)}
 
     @app.post("/predict")
     async def predict(query: Query):
@@ -66,6 +67,9 @@ def create_app(config=None, backend=None):
         except (TimeoutError, httpx.TimeoutException) as error:
             event.update(status="timeout", error=type(error).__name__)
             raise HTTPException(504, "Quá deadline nội bộ; không retry model.") from error
+        except ModelOutputError as error:
+            event.update(status="error", error=str(error), **error.details)
+            raise HTTPException(502, "Model không trả kết quả hợp lệ; xem requests.jsonl.") from error
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             event.update(status="error", error=str(error))
             raise HTTPException(502, "Model không trả kết quả hợp lệ; xem requests.jsonl.") from error

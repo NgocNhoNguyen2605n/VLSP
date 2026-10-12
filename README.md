@@ -27,7 +27,7 @@ Baseline: `Qwen/Qwen2.5-Math-7B-Instruct`, backbone FP16, **LoRA thuần**, khô
 
 - Train **5 epoch với seed 42**, mặc định xuất checkpoint epoch 5 (`fixed_epoch`). Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU (effective batch 16), LoRA rank 16/alpha 32/dropout 0 (40.370.176 tham số học), learning rate baseline đơn lẻ `1e-4`. Sweep vẫn thử ba learning rate đã cấu hình.
 - Backbone có **7.615.616.512 tham số**, LoRA thêm **40.370.176**, tổng **7.655.986.688 < 8B**. Trọng số FP16 khoảng **14,19 GiB tổng**. Qwen2.5-Math-7B có embedding và lm_head riêng (`tie_word_embeddings=false`): FSDP2 shard decoder/embedding, giữ lm_head frozen và LoRA đầy đủ trên mỗi GPU. Riêng backbone khoảng **7,60 GiB/GPU**; LoRA FP32 + gradient + hai trạng thái AdamW khoảng **0,60 GiB/GPU**, chưa gồm activation/buffer. Micro-batch 4/GPU; cần đo peak VRAM thực tế trên T4 x2.
-- Dùng chat template Qwen2.5-Math-7B-Instruct chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Sinh greedy một lần mỗi câu; không dùng công cụ tính toán bên ngoài.
+- Dùng chat template Qwen2.5-Math-7B-Instruct chính thức và học lời giải trong `explanation`, sau đó trả `answer`, `unit`, `reasoning=null`. Inference mặc định dùng self-consistency 5 mẫu/câu; không dùng công cụ tính toán bên ngoài.
 - Model card Qwen2.5-Math tập trung vào toán tiếng Anh và tiếng Trung. Khả năng giải vật lý tiếng Việt và trả JSON cần được đo sau fine-tuning trên dev; chưa có kết quả để khẳng định cải thiện so với backbone trước.
 
 Model 7B dùng revision riêng; adapter/checkpoint của model 3B cũ không tương thích. Dùng thư mục output mới và train lại LoRA. Context của model Math là **4096 token**; max_length training vẫn 2048, max_new_tokens vẫn 1000. Serving FP16 trên một GPU nên dùng máy có đủ chỗ cho 14,19 GiB trọng số cùng KV cache/runtime; GPU 24 GiB có nhiều dư địa hơn T4 16 GiB. Chưa đo latency/VRAM của 7B trên máy triển khai.
@@ -65,7 +65,7 @@ giữ trọng số backbone đầy đủ trên mỗi GPU trong toàn bộ vòng 
 Batch đầu vẫn gom trọng số và thời gian này nằm trong timer; các token/batch sau dùng lại
 trọng số, tránh all-gather mỗi token. Dev loss vẫn chạy với sharding thông thường.
 Sau generation, kể cả khi có exception, code reshard từng module và khôi phục policy
-training (root=False, embedding/decoder=True). KV cache, greedy, prompt và adapter giữ cùng cấu hình.
+training (root=False, embedding/decoder=True). KV cache, decoding, prompt và adapter giữ cùng cấu hình.
 `generation_keep_unsharded` trong metrics ghi nhận chế độ đã dùng.
 Chế độ này tăng VRAM: khoảng 14,19 GiB trọng số đầy đủ/GPU, còn cần chỗ cho shard/buffer,
 LoRA/optimizer, KV cache và activation. Cần đo peak VRAM/tốc độ trên T4;
@@ -74,7 +74,7 @@ Với `fixed_epoch`, chỉ tính loss nên không vào chế độ giữ trọng
 Lệnh evaluate riêng dùng model chia lớp trong một tiến trình, không dùng FSDP2.
 
 1. Dùng toàn bộ **677 mẫu train** trong `train_dataset.csv` để học. **339 mẫu `dev_dataset.csv`** dùng validation; không chia lại train, không đưa dev vào optimizer. `split.json` chỉ ghi hash và ID của hai CSV riêng để worker kiểm tra đúng dữ liệu.
-2. Khởi tạo backbone gốc + LoRA mới, train **5 epoch với seed 42**. Sau mỗi epoch, tính dev loss và sinh greedy theo batch 4 (`validation_batch_size=4`), lưu checkpoint + predictions + metrics. Dev 339 câu có **85 batch generation/epoch** (batch cuối 3 câu). Hai rank cùng xử lý một batch 4 câu, không phải 4 câu riêng/GPU.
+2. Khởi tạo backbone gốc + LoRA mới, train **5 epoch với seed 42**. Với `answer_accuracy`, sau mỗi epoch tính dev loss và sinh 5 mẫu/câu theo batch 4 (`validation_batch_size=4`), lưu checkpoint + predictions + metrics. Dev 339 câu có **85 batch generation/epoch** (batch cuối 3 câu). Một batch 4 câu có 20 chuỗi ứng viên; giảm `validation_batch_size` nếu thiếu VRAM. Hai rank cùng xử lý một batch 4 câu, không phải 4 câu riêng/GPU.
 3. Chọn epoch theo **content_tolerant accuracy** (đáp án + đơn vị). Nếu hòa: content_exact cao hơn, dev loss thấp hơn, epoch sớm hơn. Không dùng timeout để xếp hạng. Dung sai mặc định `rtol=0.05, atol=0` (5% theo đáp án chuẩn).
 4. Xuất đúng checkpoint thắng vào **`RUN_DIR/adapter`**, kèm tokenizer và `RUN_DIR/run.json`. Nếu epoch 3 thắng thì adapter xuất ra lấy trọng số epoch 3, dù đã train đủ 5 epoch. **Không retrain**, không nạp lại backbone sau bước chọn. `selection.json` lưu điểm cả 5 epoch và checkpoint thắng, `experiment.json` chuyển sang `complete`.
 
@@ -143,6 +143,32 @@ Giới hạn token tính cho toàn bộ JSON; CoT dài có thể chiếm hết 3
 
 ## Đánh giá và độ ổn định
 
+Inference mặc định dùng **self-consistency 5**: `self_consistency_samples=5`,
+`sampling_temperature=0.7`, `sampling_top_p=0.8`.
+Transformers sinh 5 chuỗi/câu trong cùng một lượt `generate`; vLLM nhận `n=5` trong một request.
+Mẫu không hoàn tất, JSON lỗi hoặc số phần answer/unit không khớp bị loại.
+Bỏ phiếu trên toàn bộ tuple đáp án và đơn vị, không bỏ phiếu từng phần rồi ghép lời giải.
+Biểu diễn số tương đương được gộp (12 chữ số có nghĩa); chuẩn hóa alias đơn vị ASCII,
+không đổi thang đơn vị và không dùng dung sai chấm 5% để gộp phiếu.
+Nhóm nhiều phiếu nhất thắng; hòa lấy mẫu xuất hiện trước trong các nhóm hòa.
+Trả nguyên đáp án/lời giải của mẫu thắng, không lấy trung bình đáp án và không sinh thêm lượt.
+`predictions.jsonl`/log API ghi các ứng viên, số phiếu, trạng thái hòa và có đa số hay không.
+`generated_tokens` của evaluation là tổng token của các ứng viên cho câu đó.
+`fixed_epoch` vẫn chỉ tính validation loss, không chạy sampling/bỏ phiếu.
+
+Deadline API **55 giây cho toàn bộ request**, không phải 55 giây/mẫu.
+Deadline generation offline áp dụng cho cả batch gồm các ứng viên;
+thời gian báo cáo gồm generation, decode và bỏ phiếu.
+`/healthz` công bố cấu hình decoding để evaluation API phát hiện thay đổi giữa run.
+Checkpoint cũ không có các trường sampling sẽ mặc định dùng 5 mẫu khi gọi evaluate hoặc prepare.
+Để so greedy, dùng `--self-consistency-samples 1` khi evaluate hoặc đặt
+`self_consistency_samples=1` trong serving config. Restart API sau khi đổi config/prompt.
+
+```bash
+python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_SC5 --self-consistency-samples 5
+python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_GREEDY --self-consistency-samples 1
+```
+
 - Attention dùng **SDPA math**, giữ trung gian FP32 để tránh QK^T tràn FP16 trước softmax. Tắt reduced-precision reduction của GEMM FP16. Trọng số backbone vẫn FP16; không yêu cầu FlashAttention/BF16 trên T4. SDPA math có thể tăng thời gian và VRAM so với các kernel fused.
 - Nếu loss vẫn NaN/Inf, cả hai rank dừng ở cùng micro-step, ghi lỗi vào `run.json`. Nhánh một tiến trình còn có chẩn đoán projection/norm; không chạy lại riêng một rank FSDP vì có collective. Đây là lỗi forward; giảm learning rate hoặc GradScaler không sửa trực tiếp. Sau một run thất bại, dùng thư mục output mới.
 - Nếu log có `Watchdog ... _ALLGATHER_BASE ... timeout`, đó là lỗi đồng bộ NCCL, khác với loss NaN. Timeout collective là 5 phút; launcher bật flight recorder và dump khi timeout để chẩn đoán. Đây chỉ là giới hạn chờ khi bị kẹt, không phải cách sửa nguyên nhân. `train_log.json` lưu `training_seconds` từng epoch, không gồm validation generation. Sau NCCL abort, khởi động lại session Kaggle trước khi thử lại.
@@ -150,7 +176,7 @@ Giới hạn token tính cho toàn bộ JSON; CoT dài có thể chiếm hết 3
 - Run mới phải hiện `train=677, validation(dev)=339`. Nếu còn `608/68` hoặc `676/0`, cập nhật nhánh `Nhotest`, dùng notebook mới và chọn output mới. Evaluate trỏ vào thư mục experiment; nó dùng `RUN_DIR/adapter` của best epoch.
 - `content_exact`: chuỗi đáp án khớp sau NFC/khoảng trắng, đơn vị khớp sau các alias ASCII đã khai báo.
 - `content_tolerant`: cho phép biểu thức số an toàn và `abs(pred-gold) <= atol + rtol*abs(gold)`. Mặc định **rtol=0,05, atol=0**; không coi đáp án rất nhỏ là 0. Dung sai này không phải quy định BTC.
-- `p1_estimate`: content đúng và trả kết quả trong giới hạn thời gian. Greedy, mỗi câu một lần, không retry. Deadline dừng ở ranh giới token; câu thực tế vượt 60 giây vẫn bị tính sai. Đây là deadline generation, chưa bao gồm thời gian gọi API bên ngoài; một bước GPU đang chạy có thể làm thời gian thực tế vượt deadline.
+- `p1_estimate`: content đúng và trả kết quả trong giới hạn thời gian. Mỗi câu một lượt generation gồm 5 mẫu, bỏ phiếu, không retry. Deadline dừng ở ranh giới token; câu thực tế vượt 60 giây vẫn bị tính sai. Đây là deadline generation, chưa bao gồm thời gian gọi API bên ngoài; một bước GPU đang chạy có thể làm thời gian thực tế vượt deadline.
 
 Kết quả trong thư mục experiment:
 

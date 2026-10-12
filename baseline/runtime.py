@@ -8,6 +8,8 @@ import random  # Cố định bộ sinh số ngẫu nhiên Python.
 from importlib.metadata import PackageNotFoundError, version  # Ghi phiên bản thư viện thực tế.
 from pathlib import Path  # Xử lý đường dẫn local/Kaggle.
 
+from .consistency import decoding_settings
+
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -26,6 +28,10 @@ def arguments(description):
 def read_config(args):
     """Nạp cấu hình và kiểm tra các giới hạn quan trọng."""
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    cfg.setdefault("self_consistency_samples", 5)
+    cfg.setdefault("sampling_temperature", 0.7)
+    cfg.setdefault("sampling_top_p", 0.8)
+    decoding_settings(cfg)
     for name in ("data_root", "train_file", "dev_file", "output_dir"):
         if getattr(args, name, None) is not None:
             cfg[name] = getattr(args, name)
@@ -96,7 +102,7 @@ def print_training_config(cfg, target_modules, world_size=1):
         lines.extend([
             "Dữ liệu: toàn bộ train_dataset.csv | validation=dev_dataset.csv | "
             f"checkpoint_selection={cfg.get('checkpoint_selection', 'answer_accuracy')} | không retrain",
-            f"Validation: greedy | generation batch={cfg.get('validation_batch_size', 4)} | max_new_tokens={cfg['max_new_tokens']} | "
+            f"Validation: samples={decoding_settings(cfg)['samples']} | generation batch={cfg.get('validation_batch_size', 4)} | max_new_tokens={cfg['max_new_tokens']} | "
             f"timeout_seconds={cfg['timeout_seconds']} | rtol={cfg['rtol']:g} | atol={cfg['atol']:g}",
         ])
         if cfg.get("checkpoint_selection") == "fixed_epoch":

@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from .evaluate import generate_batch
+from .consistency import decoding_settings
 from .metrics import parse_prediction, score_prediction
 from .runtime import save_json
 from .progress import BatchProgress
@@ -27,7 +28,7 @@ def checkpoint_rank(result):
 
 def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, primary=True,
                    generation_context=None):
-    """Loss có trọng số token; sinh một lần mỗi câu và so đáp án + đơn vị."""
+    """Loss có trọng số token; chấm đáp án đã bỏ phiếu khi bật generation."""
     batch_size = cfg.get("validation_batch_size", 4)
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("validation_batch_size phải là số nguyên dương.")
@@ -74,6 +75,7 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
     previous_cache = model.config.use_cache
     model.config.use_cache = True
     result.update(generation_batch_size=batch_size,
+                  decoding=decoding_settings(cfg),
                   generation_timing="seconds là thời gian chung của batch, không chia cho số câu")
     try:
         handle_context = ((result_dir / "predictions.jsonl").open("w", encoding="utf-8")
@@ -85,10 +87,12 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
             result["generation_keep_unsharded"] = bool(retained)
             for index, start in enumerate(range(0, len(rows), batch_size), start=1):
                 batch_rows = rows[start:start + batch_size]
-                outputs = generate_batch(model, tokenizer, [row["question"] for row in batch_rows], cfg)
+                diagnostics = []
+                outputs = generate_batch(model, tokenizer, [row["question"] for row in batch_rows], cfg,
+                                         diagnostics=diagnostics)
                 if len(outputs) != len(batch_rows):
                     raise RuntimeError("Generation trả sai số câu trong batch validation.")
-                for row, (raw, elapsed, token_count, finished) in zip(batch_rows, outputs):
+                for row_index, (row, (raw, elapsed, token_count, finished)) in enumerate(zip(batch_rows, outputs)):
                     prediction = parse_prediction(raw)
                     score = score_prediction(prediction, row, cfg["rtol"], cfg["atol"])
                     over_time = elapsed > cfg["timeout_seconds"]
@@ -105,6 +109,7 @@ def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, pri
                                                  "seconds": elapsed, "generated_tokens": token_count,
                                                  "finished": finished, "over_time": over_time,
                                                  "generation_batch": index,
+                                                 "self_consistency": diagnostics[row_index] if diagnostics else None,
                                                  "generation_batch_size": len(batch_rows)}, ensure_ascii=False) + "\n")
                         handle.flush()
                 progress.update(index)

@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 
 from .config import ServingConfig
+from baseline.consistency import decoding_settings
 
 
 def vllm_command(cfg, backend="cuda", executable="vllm"):
@@ -21,7 +22,8 @@ def vllm_command(cfg, backend="cuda", executable="vllm"):
                "--revision", cfg.revision, "--tokenizer-revision", cfg.revision,
                "--served-model-name", cfg.base_model, "--host", "127.0.0.1", "--port", "8000",
                "--dtype", "float16", "--tensor-parallel-size", "1",
-               "--max-model-len", str(cfg.max_model_len), "--max-num-seqs", "1",
+               "--max-model-len", str(cfg.max_model_len),
+               "--max-num-seqs", str(decoding_settings(cfg)["samples"]),
                "--gpu-memory-utilization", str(cfg.gpu_memory_utilization),
                "--generation-config", "vllm", "--seed", str(cfg.seed)]
     if backend == "metal":

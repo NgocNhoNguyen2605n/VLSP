@@ -72,13 +72,22 @@ def numeric_value(value):
 
 
 def parse_prediction(text):
-    """Chấp nhận đúng một JSON object; JSON hỏng không được chữa bằng nhãn dev."""
+    """Đọc một JSON object; cho phép xuống dòng/tab trong chuỗi, giữ nội dung."""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
     try:
         result = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError:
+        # Model đôi khi sinh newline/tab thật trong explanation thay vì escape.
+        # Chỉ nới cách đọc whitespace; không sửa dấu ngoặc, fields hay đáp án.
+        if any(ord(char) < 32 and char not in "\n\r\t" for char in text):
+            return None
+        try:
+            result = json.loads(text, strict=False)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    except ValueError:
         return None
     if not isinstance(result, dict):
         return None

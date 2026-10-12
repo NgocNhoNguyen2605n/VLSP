@@ -1,4 +1,4 @@
-"""Sinh đáp án dev một lần mỗi câu và báo P1 ước lượng, không dùng API."""
+"""Sinh và bỏ phiếu đáp án dev; báo P1 ước lượng, không dùng API."""
 
 from .runtime import environment, save_json, setup_seed  # Seed, môi trường và báo cáo.
 
@@ -12,6 +12,7 @@ import torch  # Inference không gradient, dùng FP16 trên hai GPU.
 from transformers import GenerationConfig, StoppingCriteria, StoppingCriteriaList  # Greedy và deadline.
 
 from .data import load_data, prompt_ids  # Prompt chỉ có câu hỏi.
+from .consistency import decoding_settings, select_consistent
 from .metrics import canonical_text, parse_prediction, score_prediction  # Evaluator P1 tạm thời.
 from .model import load_model, load_tokenizer  # Nạp backbone và adapter đã lưu.
 
@@ -37,17 +38,21 @@ def synchronize(gpu_count):
         torch.cuda.synchronize(i)
 
 
-def generate_once(model, tokenizer, question, cfg):
-    """Greedy một lần; không retry JSON hỏng, không dùng answer/cot của dev."""
-    return generate_batch(model, tokenizer, [question], cfg)[0]
+def generate_once(model, tokenizer, question, cfg, diagnostics=None):
+    """Một lượt generation cho một câu; không retry hoặc dùng nhãn dev."""
+    if diagnostics is None:
+        return generate_batch(model, tokenizer, [question], cfg)[0]
+    return generate_batch(model, tokenizer, [question], cfg, diagnostics=diagnostics)[0]
 
 
-def generate_batch(model, tokenizer, questions, cfg):
-    """Greedy với left padding; mỗi câu một output, thời gian chung của batch."""
+def generate_batch(model, tokenizer, questions, cfg, diagnostics=None):
+    """Sinh nhiều mẫu trong một batch, trả một kết quả đã bỏ phiếu cho mỗi câu."""
     if not questions:
         raise ValueError("Batch generation không được rỗng.")
     synchronize(cfg["gpu_count"])
     start = time.perf_counter()
+    decoding = decoding_settings(cfg)
+    samples = decoding["samples"]
     prompts = [prompt_ids(tokenizer, question) for question in questions]
     width = max(map(len, prompts))
     if width + cfg["max_new_tokens"] > model.config.max_position_embeddings:
@@ -59,9 +64,11 @@ def generate_batch(model, tokenizer, questions, cfg):
         tensor[index, -len(ids):] = torch.tensor(ids, dtype=torch.long, device=device)
         mask[index, -len(ids):] = 1
     generation = GenerationConfig(
-        do_sample=False, num_beams=1, max_new_tokens=cfg["max_new_tokens"],
+        do_sample=samples > 1, num_beams=1, num_return_sequences=samples,
+        max_new_tokens=cfg["max_new_tokens"],
         eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
-        use_cache=True, temperature=None, top_p=None, top_k=None)
+        use_cache=True, temperature=decoding["temperature"] if samples > 1 else None,
+        top_p=decoding["top_p"] if samples > 1 else None, top_k=0 if samples > 1 else None)
     with torch.inference_mode(), torch.autocast(tensor.device.type, dtype=torch.float16):
         output = model.generate(
             input_ids=tensor, attention_mask=mask,
@@ -69,19 +76,35 @@ def generate_batch(model, tokenizer, questions, cfg):
             synced_gpus=torch.distributed.is_initialized(),
             stopping_criteria=StoppingCriteriaList([Deadline(start + cfg["timeout_seconds"])]))
     synchronize(cfg["gpu_count"])
-    elapsed = time.perf_counter() - start
-    results = []
+    if output.shape[0] != len(questions) * samples:
+        raise ValueError("Generation không trả đủ số mẫu cho mỗi câu hỏi.")
+    candidates = []
     for tokens in output[:, width:].tolist():
         # Câu kết thúc sớm được pad trong khi các câu còn lại tiếp tục sinh.
         finished = tokenizer.eos_token_id in tokens
         if finished:
             tokens = tokens[:tokens.index(tokenizer.eos_token_id) + 1]
         text = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        results.append((text, elapsed, len(tokens), finished))
-    return results
+        candidates.append({"raw_output": text, "generated_tokens": len(tokens), "finished": finished})
+    results = []
+    for start_index in range(0, len(candidates), samples):
+        group = candidates[start_index:start_index + samples]
+        selected, details = select_consistent(group)
+        if samples == 1:
+            # Giữ hành vi greedy cũ, kể cả output bị cắt, để so sánh baseline.
+            selected = 0
+        winner = group[selected] if selected is not None else {
+            "raw_output": "", "finished": all(candidate["finished"] for candidate in group)}
+        results.append((winner["raw_output"], 0.0,
+                        sum(candidate["generated_tokens"] for candidate in group), winner["finished"]))
+        if diagnostics is not None:
+            diagnostics.append(details)
+    elapsed = time.perf_counter() - start
+    return [(raw, elapsed, tokens, finished) for raw, _, tokens, finished in results]
 
 
-def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file=None):
+def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file=None,
+             self_consistency_samples=None, sampling_temperature=None, sampling_top_p=None):
     """Chấm mọi dòng dev; báo riêng content đúng và đúng trong giới hạn thời gian."""
     run_dir = Path(run_dir)
     if (run_dir / "experiment.json").is_file():
@@ -100,6 +123,14 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
     if manifest.get("training_status", "complete") != "complete":
         raise RuntimeError("Train chưa hoàn tất; không chấm adapter của lần chạy đang dở.")
     cfg = manifest["config"].copy()
+    for key, value, default in (("self_consistency_samples", self_consistency_samples, 5),
+                                ("sampling_temperature", sampling_temperature, 0.7),
+                                ("sampling_top_p", sampling_top_p, 0.8)):
+        if value is not None:
+            cfg[key] = value
+        else:
+            cfg.setdefault(key, default)
+    decoding = decoding_settings(cfg)
     if data_root:
         cfg.update(data_root=data_root, train_file=None, dev_file=None)
     if train_file is not None:
@@ -124,11 +155,13 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
               "content_tolerant": 0, "p1_estimate": 0, "over_time": 0,
               "unfinished_generation": 0, "unsupported_symbolic": 0,
               "overlap_samples": 0, "overlap_correct": 0, "unseen_correct": 0}
-    print(f"Evaluate {counts['total']} mẫu | greedy | seed={cfg['seed']} | "
+    print(f"Evaluate {counts['total']} câu | samples={decoding['samples']} | seed={cfg['seed']} | "
           f"rtol={cfg['rtol']}, atol={cfg['atol']} (tạm thời).", flush=True)
     with (result_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
         for index, row in enumerate(splits["dev"], start=1):
-            raw, elapsed, token_count, finished = generate_once(model, tokenizer, row["question"], cfg)
+            diagnostics = []
+            raw, elapsed, token_count, finished = generate_once(model, tokenizer, row["question"], cfg,
+                                                              diagnostics=diagnostics)
             prediction = parse_prediction(raw)
             if prediction is not None:
                 prediction["query_id"] = row["id"]
@@ -150,13 +183,15 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
                       "gold_answer": row["answer"], "gold_unit": row["unit"],
                       "seconds": elapsed, "generated_tokens": token_count, "finished": finished,
                       "score": score, "over_time": timed_out,
-                      "p1_estimate_correct": correct, "overlap_train": overlap}
+                      "p1_estimate_correct": correct, "overlap_train": overlap,
+                      "self_consistency": diagnostics[0] if diagnostics else None}
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
             if index % 25 == 0 or index == counts["total"]:
                 print(f"Dev {index}/{counts['total']} | đúng ước lượng={counts['p1_estimate']}", flush=True)
     summary = {**counts, "accuracy_estimate": counts["p1_estimate"] / counts["total"],
                "rtol": cfg["rtol"], "atol": cfg["atol"], "timeout_seconds": cfg["timeout_seconds"],
+               "decoding": decoding,
                "official_metric": False, "environment": environment(), "data": info,
                "notes": ["BTC chưa công bố dung sai và evaluator chính thức.",
                          "Exact: chuỗi đáp án sau NFC/khoảng trắng + đơn vị alias ASCII.",
@@ -180,8 +215,12 @@ def main():
     parser.add_argument("--data-root")
     parser.add_argument("--train-file")
     parser.add_argument("--dev-file")
+    parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu/câu; mặc định run hoặc 5, dùng 1 để so greedy")
+    parser.add_argument("--sampling-temperature", type=float)
+    parser.add_argument("--sampling-top-p", type=float)
     args = parser.parse_args()
-    evaluate(args.run_dir, args.result_dir, args.data_root, args.train_file, args.dev_file)
+    evaluate(args.run_dir, args.result_dir, args.data_root, args.train_file, args.dev_file,
+             args.self_consistency_samples, args.sampling_temperature, args.sampling_top_p)
 
 
 if __name__ == "__main__":

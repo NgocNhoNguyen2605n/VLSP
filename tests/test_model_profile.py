@@ -33,7 +33,7 @@ class ModelProfileTests(unittest.TestCase):
     def test_serving_rejects_an_old_backbone_or_revision(self):
         for overrides in ({"base_model": "Qwen/Qwen2.5-3B-Instruct"},
                           {"revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1"}):
-            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "backbone/revision"):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "(?i)backbone/revision"):
                 ServingConfig(**overrides)
 
     def test_prepare_rejects_old_training_before_writing_deployment(self):
@@ -58,6 +58,7 @@ class ModelProfileTests(unittest.TestCase):
             serving.require_prepared()
             provenance = json.loads((output / "provenance.json").read_text())
             self.assertEqual(serving.model_name, BASE_MODEL)
+            self.assertEqual(serving.self_consistency_samples, 5)
             self.assertEqual(provenance["base_parameters"], 7_615_616_512)
             self.assertEqual(provenance["total_parameters"], BASE_PARAMETERS)
             self.assertLess(provenance["total_parameters"], 8_000_000_000)
@@ -72,6 +73,7 @@ class ModelProfileTests(unittest.TestCase):
             (adapter / "adapter_config.json").write_text('{"r":16}')
             cfg = ServingConfig(adapter_path=str(adapter))
             command = vllm_command(cfg)
+            self.assertEqual(command[command.index("--max-num-seqs") + 1], "5")
             self.assertEqual(command[:3], ["vllm", "serve", BASE_MODEL])
             for flag in ("--revision", "--tokenizer-revision"):
                 self.assertEqual(command[command.index(flag) + 1], REVISION)

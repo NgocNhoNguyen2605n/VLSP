@@ -79,7 +79,10 @@ def prepare(output_dir, run_dir=None, base_only=False, team_name="Viper"):
             raise ValueError("Số tham số adapter/backbone không khớp manifest training.")
         cfg.update(base_model=model_id, revision=training_cfg["revision"],
                    model_name=f"{team_name}-{model_id.split('/')[-1].removesuffix('-Instruct')}-LoRA",
-                   adapter_path="adapter", max_new_tokens=training_cfg["max_new_tokens"], seed=training_cfg["seed"])
+                   adapter_path="adapter", max_new_tokens=training_cfg["max_new_tokens"], seed=training_cfg["seed"],
+                   self_consistency_samples=training_cfg.get("self_consistency_samples", 5),
+                   sampling_temperature=training_cfg.get("sampling_temperature", 0.7),
+                   sampling_top_p=training_cfg.get("sampling_top_p", 0.8))
         provenance.update(base_model=model_id, revision=training_cfg["revision"], base_parameters=base_parameters,
                           adapter_parameters=count, total_parameters=base_parameters + count,
                           lora_rank=adapter_cfg["r"], adapter_epoch=run["adapter_epoch"],

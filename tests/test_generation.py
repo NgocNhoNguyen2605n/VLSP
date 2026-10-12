@@ -29,6 +29,42 @@ class Tokenizer:
 class GenerationTests(unittest.TestCase):
     cfg = {"gpu_count": 2, "max_new_tokens": 4, "timeout_seconds": 60}
 
+    def test_five_samples_are_grouped_per_question_with_one_shared_deadline(self):
+        from tests.test_consistency import candidate
+        class JSONTokenizer(Tokenizer):
+            def decode(self, tokens, **kwargs):
+                return candidate(str(tokens[0]))["raw_output"]
+        model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=64),
+                                get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1)))
+        def generate(**kwargs):
+            config = kwargs["generation_config"]
+            self.assertTrue(config.do_sample)
+            self.assertEqual(config.num_return_sequences, 5)
+            self.assertEqual((config.temperature, config.top_p, config.top_k), (0.7, 0.8, 0))
+            self.assertEqual(kwargs["stopping_criteria"][0].deadline, 70)
+            tails = torch.tensor([[9, 2], [8, 2], [9, 2], [9, 2], [7, 2],
+                                  [6, 2], [5, 2], [5, 2], [6, 2], [6, 2]])
+            return torch.cat((kwargs["input_ids"].repeat_interleave(5, dim=0), tails), dim=1)
+        model.generate = generate
+        diagnostics = []
+        with patch("baseline.evaluate.synchronize"), patch("baseline.evaluate.time.perf_counter", side_effect=[10, 13]):
+            results = generate_batch(model, JSONTokenizer(), ["1", "2"],
+                                     {**self.cfg, "self_consistency_samples": 5}, diagnostics=diagnostics)
+        self.assertEqual([json.loads(raw)["answer"] for raw, _, _, _ in results], ["9", "6"])
+        self.assertEqual([(seconds, tokens, finished) for _, seconds, tokens, finished in results],
+                         [(3, 10, True), (3, 10, True)])
+        self.assertEqual([info["vote_count"] for info in diagnostics], [3, 3])
+
+    def test_no_valid_sample_returns_invalid_prediction_without_retry(self):
+        model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=64),
+                                get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1)))
+        def generate(**kwargs):
+            return torch.cat((kwargs["input_ids"].repeat_interleave(5, dim=0), torch.ones((5, 2), dtype=torch.long)), dim=1)
+        model.generate = generate
+        with patch("baseline.evaluate.synchronize"), patch("baseline.evaluate.time.perf_counter", side_effect=[10, 13]):
+            results = generate_batch(model, Tokenizer(), ["1"], {**self.cfg, "self_consistency_samples": 5})
+        self.assertEqual(results, [("", 3, 10, False)])
+
     def test_fixed_epoch_validation_never_generates_or_reports_accuracy(self):
         model = SimpleNamespace(config=SimpleNamespace(use_cache=False),
                                 get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1)))
@@ -110,7 +146,7 @@ class GenerationTests(unittest.TestCase):
         loader = [{"labels": torch.tensor([[-100, 1]])}]
         cfg = {**self.cfg, "seed": 42, "validation_batch_size": 4, "rtol": .05, "atol": 0}
         calls = []
-        def generation(model, tokenizer, questions, config):
+        def generation(model, tokenizer, questions, config, diagnostics=None):
             calls.append(questions)
             return [(json.dumps({"answer": question, "unit": "V", "explanation": "Giải"}), .1, 10, True)
                     for question in questions]

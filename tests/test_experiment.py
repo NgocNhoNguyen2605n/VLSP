@@ -281,7 +281,7 @@ class ExperimentTests(unittest.TestCase):
                 initialized.append((config["training_stage"], config["seed"]))
                 return model, plan
 
-            def generation(model, tokenizer, questions, config):
+            def generation(model, tokenizer, questions, config, diagnostics=None):
                 epoch = len(calls) // 3 + 1
                 calls.extend(questions)
                 answer = "1" if epoch == 3 else "99"
