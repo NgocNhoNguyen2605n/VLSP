@@ -55,24 +55,35 @@ def create_report(train_file, dev_file, output, deployment=None, font=None, bold
     def add(text, style="body"):
         story.append(Paragraph(text, styles[style]))
     team = provenance["team_name"] if provenance else "Viper"
+    model_id = provenance["base_model"] if provenance else BASE_MODEL
+    base_parameters = provenance["base_parameters"] if provenance else BASE_PARAMETERS
     add(escape(team) + " | ViPRA 2026", "title")
     add("System description" if provenance else "DRAFT - PENDING TRAINED ADAPTER", "head")
     if not provenance:
         add("Preparation draft. The training method below is planned; no trained adapter or measured test results are available yet.")
     add("1. Data and origin", "head")
-    add(f"Official ViPPS, Physics_Dataset_no_image (Vietnamese electricity and magnetism text problems): {len(train)} training examples and {len(dev)} development examples. The team supplies a reviewed training CSV with revised reference explanations, some answers and units; questions are preserved. Development examples are used for validation only. No additional external, crawled or synthetic fine-tuning data are used by this pipeline. Backbone pretraining is inherited from Qwen.")
-    for row in train[:2]:
+    origin = provenance.get("data_origin") if provenance else None
+    if origin:
+        add(f"Official ViPPS, Physics_Dataset_no_image (Vietnamese electricity and magnetism text problems): {origin['official_train_samples']} reviewed official training examples; {len(dev)} development examples for validation only. The team adds {origin['augmented_train_samples']} synthetic training examples derived from ViPPS physics templates, recomputed numerical parameters, Vietnamese paraphrases, concise explanations and equivalent unit conversions. Total training samples: {len(train)}. The combined CSV was cleaned before training. No other external/crawled dataset is used; backbone pretraining is inherited from Qwen.")
+        examples = [next(row for row in train if "_AUG_" not in row["id"]),
+                    next(row for row in train if "_AUG_" in row["id"])]
+    else:
+        add(f"Official ViPPS, Physics_Dataset_no_image (Vietnamese electricity and magnetism text problems): {len(train)} training examples and {len(dev)} development examples. The team supplies a reviewed training CSV with revised reference explanations, some answers and units; questions are preserved. Development examples are used for validation only. No additional external, crawled or synthetic fine-tuning data are used by this pipeline. Backbone pretraining is inherited from Qwen.")
+        examples = train[:2]
+    for row in examples:
         add(escape(f"Sample {row['id']}: {row['question']} Answer: {row['answer']} {row['unit']}"))
     add("2. Method", "head")
     cfg = provenance["training_config"] if provenance else json.loads((Path(__file__).resolve().parents[1] / "configs/baseline.json").read_text(encoding="utf-8"))
     epoch = provenance["adapter_epoch"] if provenance else cfg["selected_epoch"]
-    add(f"{BASE_MODEL.split('/')[-1]} uses its official chat template. Supervised fine-tuning maps each question to one JSON object containing explanation, answer, unit and reasoning=null. Teacher forcing learns only assistant tokens. Training uses FP16 frozen backbone, FP32 LoRA, seed {cfg['seed']} and {cfg['epochs']} epochs; FSDP2 distributes training across GPUs. The exported adapter is epoch {epoch} ({escape(str(cfg.get('checkpoint_selection', 'answer_accuracy')))} selection).")
-    add(f"Inference runs one self-hosted vLLM engine with the selected LoRA. The training prompt is retained; greedy decoding generates explanation and answer in one call, at most {cfg['max_new_tokens']} new tokens. The API attaches the original query_id, normalizes known units to ASCII, and returns a one-element JSON list. Multipart answers and units use '; ' in matching order. No answer labels, retrieval system, external solver or third-party inference API are used at prediction time.")
+    add(f"{model_id.split('/')[-1]} uses its official chat template. Supervised fine-tuning maps each question to one JSON object containing explanation, answer, unit and reasoning=null. Teacher forcing learns only assistant tokens. Training uses FP16 frozen backbone, FP32 LoRA, seed {cfg['seed']} and {cfg['epochs']} epochs; FSDP2 distributes training across GPUs. The exported adapter is epoch {epoch} ({escape(str(cfg.get('checkpoint_selection', 'answer_accuracy')))} selection).")
+    precision = ("The backbone is converted from the pinned revision to MLX affine 4-bit (group size 64); LoRA is applied separately through vLLM Metal on Apple Silicon. "
+                 if provenance and provenance.get("inference_precision") == "mlx-4bit" else "")
+    add(f"Inference runs one self-hosted vLLM engine with the selected LoRA. {precision}The training prompt is retained; greedy decoding generates explanation and answer in one call, at most {cfg['max_new_tokens']} new tokens. The API attaches the original query_id, normalizes units to ASCII, and returns a one-element JSON list. Multipart answers and units use '; ' in matching order. No answer labels, retrieval, external solver or third-party inference API are used at prediction time.")
     add("3. Models and capacity", "head")
     # Qwen2.5-Math-7B: 28 lớp, tổng (in + out) của 7 projection/lớp = 90,112.
     adapter = provenance["adapter_parameters"] if provenance else cfg["lora_rank"] * 28 * 90_112
-    total = BASE_PARAMETERS + adapter
-    add(f"Only LLM: {BASE_MODEL} ({BASE_PARAMETERS:,} parameters), plus LoRA ({adapter:,} parameters). Conservative total: {BASE_PARAMETERS:,} + {adapter:,} = {total:,} &lt; 8,000,000,000. vLLM model cards for the backbone and LoRA refer to one shared backbone instance. No other LLM is loaded for this solution.")
+    total = base_parameters + adapter
+    add(f"Only LLM: {model_id} ({base_parameters:,} parameters), plus LoRA ({adapter:,} parameters). Conservative total: {base_parameters:,} + {adapter:,} = {total:,} &lt; 8,000,000,000. vLLM model cards for the backbone and LoRA refer to one shared backbone instance. No other LLM is loaded for this solution.")
     add("4. Serving contract", "head")
     add("POST /predict accepts query_id and query. GET /v1/models forwards the actual vLLM model listing. The application enforces a 55-second internal deadline within the committee's 60-second request limit. Endpoint availability and latency must be checked on the deployment GPU before the registered one-hour grading slot.")
     path = Path(output)

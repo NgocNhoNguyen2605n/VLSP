@@ -10,6 +10,10 @@ BASE_MODEL = "Qwen/Qwen2.5-Math-7B-Instruct"
 REVISION = "ef9926d75ab1d54532f6a30dd5e760355eb9aa4d"
 BASE_PARAMETERS = 7_615_616_512
 DEFAULT_MODEL_NAME = "Viper-Qwen2.5-Math-7B-LoRA"
+SUPPORTED_BACKBONES = {
+    BASE_MODEL: (REVISION, BASE_PARAMETERS),
+    "Qwen/Qwen2.5-3B-Instruct": ("aa8e72537993ba99e69dfaafa59ed015b17504d1", 3_085_938_688),
+}
 
 
 @dataclass(frozen=True)
@@ -28,10 +32,13 @@ class ServingConfig:
     log_dir: str = "outputs/serving"
     prepared: bool = False
     base_only: bool = False
+    backbone_path: str | None = None
+    backbone_precision: str = "float16"
 
     def __post_init__(self):
-        if self.base_model != BASE_MODEL or self.revision != REVISION:
-            raise ValueError(f"Serving này yêu cầu đúng backbone/revision {BASE_MODEL} của repo.")
+        expected = SUPPORTED_BACKBONES.get(self.base_model)
+        if expected is None or self.revision != expected[0]:
+            raise ValueError("Backbone/revision serving chưa được khai báo hoặc không khớp checkpoint.")
         if not self.model_name.strip() or not self.team_name.strip():
             raise ValueError("team_name/model_name không được rỗng.")
         if type(self.max_new_tokens) is not int or not 0 < self.max_new_tokens < self.max_model_len:
@@ -47,6 +54,10 @@ class ServingConfig:
             raise ValueError("LoRA phải có model_name riêng để tránh gọi nhầm backbone.")
         if self.base_only and (self.model_name != self.base_model or self.adapter_path):
             raise ValueError("base_only phải dùng tên backbone và không có adapter.")
+        if self.backbone_precision not in ("float16", "mlx-4bit"):
+            raise ValueError("backbone_precision cần float16 hoặc mlx-4bit.")
+        if self.backbone_precision == "mlx-4bit" and not self.backbone_path:
+            raise ValueError("mlx-4bit cần backbone_path đã chuyển đổi.")
 
     @classmethod
     def load(cls, path=None):
@@ -60,6 +71,9 @@ class ServingConfig:
         if values.get("log_dir"):
             logs = Path(values["log_dir"])
             values["log_dir"] = str((path.parent / logs).resolve() if not logs.is_absolute() else logs)
+        if values.get("backbone_path"):
+            backbone = Path(values["backbone_path"])
+            values["backbone_path"] = str((path.parent / backbone).resolve() if not backbone.is_absolute() else backbone)
         return cls(**values)
 
     def require_prepared(self):
@@ -69,3 +83,11 @@ class ServingConfig:
             for name in ("adapter_config.json", "adapter_model.safetensors"):
                 if not self.adapter_path or not (Path(self.adapter_path) / name).is_file():
                     raise FileNotFoundError(f"Thiếu adapter đã chuẩn bị: {name}.")
+        if self.backbone_path:
+            folder = Path(self.backbone_path)
+            conversion = json.loads((folder / "conversion.json").read_text())
+            if conversion.get("base_model") != self.base_model or conversion.get("revision") != self.revision:
+                raise ValueError("Backbone chuyển đổi khác model/revision của checkpoint.")
+            config = json.loads((folder / "config.json").read_text())
+            if self.backbone_precision == "mlx-4bit" and config.get("quantization", {}).get("bits") != 4:
+                raise ValueError("Backbone không có metadata MLX 4-bit.")

@@ -8,7 +8,7 @@ import shutil
 from dataclasses import asdict
 from pathlib import Path
 
-from .config import BASE_MODEL, BASE_PARAMETERS, REVISION, ServingConfig
+from .config import BASE_MODEL, BASE_PARAMETERS, REVISION, SUPPORTED_BACKBONES, ServingConfig
 
 
 def sha256(path):
@@ -59,12 +59,15 @@ def prepare(output_dir, run_dir=None, base_only=False, team_name="Viper"):
             raise ValueError("Cần --run-dir đã train; --base-only chỉ dành cho kiểm tra backbone.")
         source, run = resolve_run(run_dir)
         training_cfg = run["config"]
-        if training_cfg["model_id"] != BASE_MODEL or training_cfg["revision"] != REVISION:
+        model_id = training_cfg["model_id"]
+        expected = SUPPORTED_BACKBONES.get(model_id)
+        if expected is None or training_cfg["revision"] != expected[0]:
             raise ValueError("Checkpoint khác backbone/revision của submission.")
+        base_parameters = expected[1]
         adapter = source / "adapter"
         adapter_cfg = json.loads((adapter / "adapter_config.json").read_text())
-        if adapter_cfg.get("base_model_name_or_path") != BASE_MODEL or adapter_cfg.get("peft_type") != "LORA":
-            raise ValueError(f"Adapter không phải LoRA của {BASE_MODEL}.")
+        if adapter_cfg.get("base_model_name_or_path") != model_id or adapter_cfg.get("peft_type") != "LORA":
+            raise ValueError(f"Adapter không phải LoRA của {model_id}.")
         weights = adapter / "adapter_model.safetensors"
         from safetensors import safe_open
         with safe_open(str(weights), framework="pt", device="cpu") as tensors:
@@ -72,10 +75,13 @@ def prepare(output_dir, run_dir=None, base_only=False, team_name="Viper"):
             if not names or any("lora_" not in name for name in names):
                 raise ValueError("Adapter thiếu LoRA hoặc chứa weights khác chưa khai báo.")
             count = sum(math.prod(tensors.get_slice(name).get_shape()) for name in names)
-        if count != run["model"]["trainable_parameters"] or run["model"]["base_parameters"] != BASE_PARAMETERS:
+        if count != run["model"]["trainable_parameters"] or run["model"]["base_parameters"] != base_parameters:
             raise ValueError("Số tham số adapter/backbone không khớp manifest training.")
-        cfg.update(adapter_path="adapter", max_new_tokens=training_cfg["max_new_tokens"], seed=training_cfg["seed"])
-        provenance.update(adapter_parameters=count, total_parameters=BASE_PARAMETERS + count,
+        cfg.update(base_model=model_id, revision=training_cfg["revision"],
+                   model_name=f"{team_name}-{model_id.split('/')[-1].removesuffix('-Instruct')}-LoRA",
+                   adapter_path="adapter", max_new_tokens=training_cfg["max_new_tokens"], seed=training_cfg["seed"])
+        provenance.update(base_model=model_id, revision=training_cfg["revision"], base_parameters=base_parameters,
+                          adapter_parameters=count, total_parameters=base_parameters + count,
                           lora_rank=adapter_cfg["r"], adapter_epoch=run["adapter_epoch"],
                           training_status="complete", datasets=run["data"],
                           training_config=training_cfg, adapter_sha256=sha256(weights),

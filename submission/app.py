@@ -33,10 +33,10 @@ def create_app(config=None, backend=None):
 
     app = FastAPI(title="Viper ViPRA 2026", lifespan=lifespan, docs_url=None, redoc_url=None)
 
-    def record(value):
+    def record(value, filename="requests.jsonl"):
         folder = Path(cfg.log_dir)
         folder.mkdir(parents=True, exist_ok=True)
-        with (folder / "requests.jsonl").open("a", encoding="utf-8") as handle:
+        with (folder / filename).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(value, ensure_ascii=False) + "\n")
 
     @app.get("/v1/models")
@@ -49,12 +49,14 @@ def create_app(config=None, backend=None):
     @app.get("/healthz")
     async def health():
         await models()
-        return {"status": "ready", "model": cfg.model_name, "team": cfg.team_name}
+        return {"status": "ready", "model": cfg.model_name, "team": cfg.team_name,
+                "backbone_precision": cfg.backbone_precision}
 
     @app.post("/predict")
     async def predict(query: Query):
         start = time.perf_counter()
         event = {"query_id": query.query_id, "query": query.query, "time_unix": time.time()}
+        record(dict(event, status="processing"), "activity.jsonl")
         try:
             async with asyncio.timeout(cfg.request_deadline_seconds):
                 async with lock:
@@ -70,6 +72,7 @@ def create_app(config=None, backend=None):
         finally:
             event["seconds"] = time.perf_counter() - start
             record(event)
+            record(event, "activity.jsonl")
 
     return app
 

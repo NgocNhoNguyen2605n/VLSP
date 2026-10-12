@@ -1,6 +1,6 @@
 # Chạy Viper trên MacBook Pro M5
 
-Nhánh Nhotest hiện dùng Qwen2.5-Math-7B-Instruct FP16. Riêng trọng số đã khoảng 14,19 GiB, chưa gồm macOS, KV cache và runtime; cấu hình Mac M5 16 GiB cũ với ngân sách 65% không đủ cho profile này. Cần máy có thêm bộ nhớ và đo thực tế; hướng dẫn dưới mô tả đường chạy Metal, chưa xác nhận 7B chạy được trên Mac hiện tại. Training FSDP2 vẫn ở NVIDIA.
+Deployment hiện tại phục vụ Qwen2.5-Math-7B-Instruct + LoRA epoch 10 từ results.zip. Bạn đã chọn lượng tử hóa backbone sang MLX affine 4-bit (group size 64) để chạy trên M5 16 GiB; trọng số backbone chuyển đổi khoảng 4,28 GB. Backbone FP16 gốc khoảng 14,19 GiB và không dùng để phục vụ trên máy này. Adapter 3B epoch 5 cũ được giữ trong deployment_qwen3b_epoch5_backup_20261012. Không gắn adapter khác backbone. Training FSDP2 vẫn ở NVIDIA.
 
 ## Các thành phần
 
@@ -8,7 +8,8 @@ Nhánh Nhotest hiện dùng Qwen2.5-Math-7B-Instruct FP16. Riêng trọng số �
 |---|---|
 | vLLM Metal | ~/.venv-vllm-metal; chạy Qwen + LoRA trên GPU Apple |
 | API Python | .venv-api; nhận input BTC, gọi vLLM và định dạng response |
-| Checkpoint | deployment/adapter/; adapter Math-7B mới, không dùng adapter 3B cũ |
+| Checkpoint | deployment/adapter/; adapter Math-7B epoch 10 |
+| Backbone 4-bit | deployment/backbone_4bit/; chuyển đổi đúng revision training |
 | Cấu hình Mac | deployment/serving-mac.json |
 | Thông tin model | http://127.0.0.1:8000/v1/models |
 | API prediction | http://127.0.0.1:8001/predict |
@@ -36,7 +37,7 @@ cd /Users/nho/Documents/ChatGPT/VLSP/source-main
 bash deploy/start_mac.sh
 ```
 
-Script giữ máy thức bằng caffeinate trong lúc chạy. Lần đầu tải backbone Math-7B đúng revision khoảng 15,2 GB vào Hugging Face cache, sau đó nạp LoRA mới đã train cho 7B. Không lượng tử hóa. max_model_len=4096; max_new_tokens kế thừa run (baseline 1000, sweep 300/1000). Ngân sách 65%/KV cache 512 MiB trước đây dành cho 3B; phải đánh giá và cấu hình lại trên Mac đủ RAM trước khi chạy 7B.
+Script giữ máy thức bằng caffeinate trong lúc chạy. Backbone Math-7B được chuyển đổi trên CPU từ revision ef9926d75ab1d54532f6a30dd5e760355eb9aa4d sang MLX 4-bit; conversion.json ghi hash nguồn/đầu ra và kiểm tra chat template khớp run. Serving dùng backbone_4bit + adapter PEFT riêng; max_model_len=4096, max_new_tokens=500 kế thừa run. gpu_memory_utilization=0.65; Metal tự cấp KV cache theo scheduler. Lượng tử hóa có thể làm đáp án khác FP16.
 
 Giữ Terminal này mở; Ctrl+C dừng API và model. Có thể dừng từ Terminal khác bằng `bash deploy/stop_mac.sh`. Để xem quá trình khởi động trong Terminal thứ hai:
 
@@ -51,7 +52,7 @@ curl http://127.0.0.1:8001/healthz
 curl http://127.0.0.1:8001/v1/models
 ```
 
-Chỉ khi /healthz trả status=ready thì API mới sẵn sàng. Model list phải có Qwen/Qwen2.5-Math-7B-Instruct và Viper-Qwen2.5-Math-7B-LoRA với parent là backbone.
+Chỉ khi /healthz trả status=ready thì API mới sẵn sàng. Với checkpoint hiện tại, model list có Qwen/Qwen2.5-Math-7B-Instruct và Viper-Qwen2.5-Math-7B-LoRA với parent là backbone. /healthz báo backbone_precision=mlx-4bit.
 
 ## 3. Gọi prediction
 
@@ -70,6 +71,25 @@ Khi nhận file public test:
 Xem predictions.json và summary.json trong output-dir. complete=true mới đủ tất cả câu. BTC chấm online qua API; file prediction là công cụ bổ sung khi bạn được cung cấp file.
 
 ## 4. Từ localhost đến URL công khai
+
+### Dịch vụ nền đã cài
+
+Runtime được sao chép vào ~/Library/Application Support/ViperService để LaunchAgent không bị macOS chặn quyền đọc Documents. Model và API chạy độc lập với chat/Terminal; không tự bật khi đăng nhập. Dùng:
+
+```bash
+cd /Users/nho/Documents/ChatGPT/VLSP/source-main
+.venv-api/bin/python -m submission.mac_service status
+.venv-api/bin/python -m submission.mac_service start
+.venv-api/bin/python -m submission.mac_service stop
+```
+
+Nếu dùng LaunchAgent, không chạy thêm start_mac.sh vì sẽ trùng cổng. Logs thực tế ở ~/Library/Application Support/ViperService/deployment/logs-mac/. Khi cập nhật code/checkpoint, dừng dịch vụ, chạy submission.mac_service install để đồng bộ runtime, rồi start.
+
+**Thay adapter giữ URL:** dùng `submission.mac_service stop --component api`, cập nhật deployment đúng backbone, chạy install rồi `submission.mac_service start --component api`. Không stop/restart component tunnel. API tạm ngừng lúc model nạp lại; URL giữ nguyên nếu tunnel vẫn sống. Sau khi thay cần kiểm tra /v1/models, chạy preflight và tạo lại PDF/ZIP.
+
+Checkpoint mới dùng 880 mẫu train (677 ViPPS reviewed + 203 augmentation), 339 dev. File train: train_dataset_augmented_30pct_clean.csv. PDF/ZIP mới nằm trong output/submission_math7b_4bit/; không dùng ZIP cũ của model 3B. Ba probe cơ bản qua Internet đạt schema/thời gian, nhưng hai probe có đáp án sai; đây không phải đánh giá accuracy toàn dev.
+
+status in URL Quick Tunnel gần nhất; cần kiểm tra /healthz qua URL đó để biết kết nối còn hoạt động. URL đổi khi tạo lại tunnel, phải cập nhật urls.txt/ZIP và chạy preflight lại. Chỉ dùng ZIP với URL đang sống. Quick Tunnel không cần tài khoản/tên miền nhưng không có cam kết uptime, phù hợp thử nghiệm. Muốn địa chỉ ổn định lâu dài, cần named tunnel và tên miền/tài khoản của bạn.
 
 127.0.0.1 chỉ truy cập được trên chính Mac. Để BTC gọi API, cần một địa chỉ HTTPS ổn định chuyển request vào cổng 8001. Bạn có thể dùng tên miền và tunnel cố định (kết nối đi ra, phù hợp mạng nhà có CGNAT), hoặc tên miền + port forwarding + Caddy nếu có IP công khai.
 

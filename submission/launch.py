@@ -17,7 +17,7 @@ from .config import ServingConfig
 
 
 def vllm_command(cfg, backend="cuda", executable="vllm"):
-    command = [executable, "serve", cfg.base_model,
+    command = [executable, "serve", cfg.backbone_path or cfg.base_model,
                "--revision", cfg.revision, "--tokenizer-revision", cfg.revision,
                "--served-model-name", cfg.base_model, "--host", "127.0.0.1", "--port", "8000",
                "--dtype", "float16", "--tensor-parallel-size", "1",
@@ -25,8 +25,11 @@ def vllm_command(cfg, backend="cuda", executable="vllm"):
                "--gpu-memory-utilization", str(cfg.gpu_memory_utilization),
                "--generation-config", "vllm", "--seed", str(cfg.seed)]
     if backend == "metal":
-        # Một request tại một thời điểm chỉ cần cache nhỏ; tránh chiếm RAM của macOS.
-        command.extend(["--kv-cache-memory-bytes", "536870912", "--enforce-eager"])
+        command.extend(["--enforce-eager"])
+    if cfg.backbone_path:
+        if backend != "metal":
+            raise ValueError("Backbone MLX chuyển đổi cần --backend metal.")
+        command.extend(["--tokenizer", cfg.backbone_path])
     if not cfg.base_only:
         adapter_cfg = json.loads((Path(cfg.adapter_path) / "adapter_config.json").read_text())
         command.extend(["--enable-lora", "--max-loras", "1", "--max-lora-rank", str(adapter_cfg["r"]),

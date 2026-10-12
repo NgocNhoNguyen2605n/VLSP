@@ -14,10 +14,10 @@ from .notation import read_mapping
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def source_zip():
+def source_zip(deployment=None):
     buffer = io.BytesIO()
     paths = []
-    for name in ("baseline", "submission", "configs", "deploy", "notebooks"):
+    for name in ("baseline", "submission", "configs", "deploy", "notebooks", "data_preparation"):
         directory = ROOT / name
         if directory.is_dir():
             paths.extend(directory.rglob("*"))
@@ -40,6 +40,28 @@ def source_zip():
                         cell.update(outputs=[], execution_count=None)
                 content = json.dumps(notebook, ensure_ascii=False, indent=1).encode()
             archive.writestr(str(relative), content)
+        if deployment:
+            deployment = Path(deployment)
+            serving_path = deployment / "serving-mac.json"
+            if not serving_path.is_file():
+                serving_path = deployment / "serving.json"
+            served = json.loads(serving_path.read_text())
+            served.update(adapter_path="../deployment/adapter", log_dir="../deployment/logs-mac")
+            if served.get("backbone_path"):
+                served["backbone_path"] = "../deployment/" + Path(served["backbone_path"]).name
+            archive.writestr("configs/served_checkpoint.json", json.dumps(served, ensure_ascii=False, indent=2))
+            if serving_path.is_file() and json.loads(serving_path.read_text()).get("backbone_path"):
+                local = Path(json.loads(serving_path.read_text())["backbone_path"])
+                local = local if local.is_absolute() else deployment / local
+                archive.writestr("configs/backbone_conversion.json", (local / "conversion.json").read_bytes())
+            provenance = json.loads((deployment / "provenance.json").read_text())
+            archive.writestr("configs/served_training.json", json.dumps({
+                "base_model": provenance["base_model"], "revision": provenance["revision"],
+                "base_parameters": provenance["base_parameters"],
+                "adapter_parameters": provenance["adapter_parameters"],
+                "adapter_sha256": provenance.get("adapter_sha256"),
+                "adapter_epoch": provenance.get("adapter_epoch"),
+                "training_config": provenance.get("training_config", {})}, ensure_ascii=False, indent=2))
     return buffer.getvalue()
 
 
@@ -82,7 +104,7 @@ def package(deployment, solution, notation, official_notation, base_url, preflig
         raise FileExistsError(f"Đã có {target}; dùng output-dir mới.")
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(solution, "solution.pdf")
-        archive.writestr("source_code.zip", source_zip())
+        archive.writestr("source_code.zip", source_zip(folder))
         archive.writestr("urls.txt", base_url + "/predict\n" + base_url + "/v1/models\n")
         archive.write(notation, "notation_mapping.csv")
     print(target.resolve())
