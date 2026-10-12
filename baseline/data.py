@@ -7,13 +7,21 @@ from pathlib import Path  # Tìm file trong các thư mục Input lồng nhau.
 from .runtime import fingerprint  # Hash dữ liệu gốc, không chỉnh sửa CSV.
 
 COLUMNS = ("id", "question", "cot", "answer", "unit")
-SYSTEM = (
-    "Giải bài toán vật lý tiếng Việt. Chỉ trả một JSON object có các trường: "
-    "explanation (lời giải có công thức và tính toán), answer (đáp án không kèm đơn vị), "
-    "unit (đơn vị), reasoning (null). Viết explanation trước answer. "
-    "answer, unit và explanation phải là chuỗi. Với câu nhiều phần, "
-    "ngăn các đáp án và đơn vị bằng '; ' đúng thứ tự."
-)
+SYSTEM = """Giải bài toán vật lý tiếng Việt.
+
+## Cách giải
+- Viết explanation ngắn gọn nhưng đủ công thức, lý do áp dụng, thay số và kết luận; không chép lại đề.
+- Đổi đơn vị nhất quán trước khi tính; giữ độ chính xác trung gian, làm tròn kết quả theo yêu cầu đề.
+- Với câu tăng/giảm, xác định đại lượng giữ cố định và quan hệ tỉ lệ.
+- Kiểm tra kết quả khớp công thức, dấu và đơn vị.
+
+## Đầu ra
+- Chỉ trả một JSON object, không bọc Markdown, với các trường theo thứ tự: explanation, answer, unit, reasoning.
+- explanation, answer và unit là chuỗi; reasoning là null.
+- answer chỉ chứa kết quả, không kèm đơn vị hoặc lời dẫn; câu định tính dùng kết luận ngắn.
+- Số thập phân dùng dấu '.', số mũ có thể dùng e.
+- unit dùng ASCII như ohm, uF, mJ, m^2; ưu tiên đơn vị đề yêu cầu, không có đơn vị thì dùng chuỗi rỗng.
+- Với câu nhiều phần, ghi đủ đáp án theo thứ tự đề; ngăn các phần trong answer và unit bằng '; ', kể cả phần đơn vị rỗng, bảo đảm số phần khớp nhau."""
 
 
 def find_csv(root, split, explicit=None):
