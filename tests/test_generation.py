@@ -65,6 +65,22 @@ class GenerationTests(unittest.TestCase):
             results = generate_batch(model, Tokenizer(), ["1"], {**self.cfg, "self_consistency_samples": 5})
         self.assertEqual(results, [("", 3, 10, False)])
 
+    def test_real_qwen_sampling_produces_five_candidates_per_question(self):
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+        torch.set_num_threads(1)
+        torch.manual_seed(42)
+        model = Qwen2ForCausalLM(Qwen2Config(vocab_size=16, hidden_size=16, intermediate_size=24,
+                    num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+                    max_position_embeddings=64)).eval()
+        diagnostics = []
+        with patch("baseline.evaluate.synchronize"):
+            results = generate_batch(model, Tokenizer(), ["1", "3"],
+                                     {**self.cfg, "self_consistency_samples": 5}, diagnostics=diagnostics)
+        self.assertEqual(len(results), 2)
+        self.assertEqual([len(info["candidates"]) for info in diagnostics], [5, 5])
+        for result, info in zip(results, diagnostics):
+            self.assertEqual(result[2], sum(c["generated_tokens"] for c in info["candidates"]))
+
     def test_fixed_epoch_validation_never_generates_or_reports_accuracy(self):
         model = SimpleNamespace(config=SimpleNamespace(use_cache=False),
                                 get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1)))
