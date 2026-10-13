@@ -1,8 +1,8 @@
 {
   "team_name": "Viper",
-  "base_model": "Qwen/Qwen3-4B-Thinking-2507",
-  "revision": "768f209d9ea81521153ed38c47d515654e938aea",
-  "model_name": "Viper-Qwen3-4B-Thinking-2507-LoRA",
+  "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+  "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "model_name": "Viper-Qwen3-4B-Instruct-2507-LoRA",
   "adapter_path": null,
   "backend_url": "http://127.0.0.1:8000",
   "max_new_tokens": 1500,

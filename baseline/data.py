@@ -116,24 +116,11 @@ def prompt_ids(tokenizer, question):
                                          return_dict=False)
 
 
-def is_thinking_tokenizer(tokenizer):
-    """Nhận biết generation prefix chính thức, không sửa chat template."""
-    prefix = tokenizer.apply_chat_template(prompt_messages(""), tokenize=False,
-                                           add_generation_prompt=True)
-    return isinstance(prefix, str) and prefix.rstrip().endswith("<think>")
-
-
 def encode_sample(tokenizer, row, max_length):
-    """Mask prompt bằng -100; chỉ học câu trả lời, không cắt ngầm mẫu dài."""
+    """Mask prompt bằng -100; Instruct học trực tiếp một JSON, không cắt ngầm."""
     target = {"explanation": row["cot"], "answer": row["answer"],
               "unit": row["unit"], "reasoning": None}
     content = json.dumps(target, ensure_ascii=False)
-    # Template Qwen3 Thinking tự mở <think> trong generation prefix.
-    # Dùng lời giải tham chiếu làm phần reasoning SFT, giữ JSON cuối cho API.
-    if is_thinking_tokenizer(tokenizer):
-        if any(tag in row["cot"] for tag in ("<think>", "</think>")):
-            raise ValueError(f"{row['id']}: cot chứa thẻ think dành riêng cho template.")
-        content = "<think>\n" + row["cot"] + "\n</think>\n\n" + content
     messages = prompt_messages(row["question"]) + [
         {"role": "assistant", "content": content}]
     prefix = prompt_ids(tokenizer, row["question"])

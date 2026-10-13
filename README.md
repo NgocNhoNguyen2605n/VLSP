@@ -23,14 +23,14 @@ Mac Apple Silicon có đường serving riêng bằng vLLM Metal: đọc [MAC_SE
 
 ## Baseline LoRA trên Kaggle
 
-Baseline: `Qwen/Qwen3-4B-Thinking-2507`, backbone FP16, **LoRA thuần**, không lượng tử hóa khi train. Model/tokenizer/template được cố định tại revision `768f209d9ea81521153ed38c47d515654e938aea`.
+Baseline: `Qwen/Qwen3-4B-Instruct-2507`, backbone FP16, **LoRA thuần**, không lượng tử hóa khi train. Model/tokenizer/template được cố định tại revision `cdbee75f17c01a7cc42f958dc650907174af0554`.
 
 - Train **5 epoch với seed 42**, xuất checkpoint epoch 5 (`fixed_epoch`). Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
 - Kiến trúc Qwen3 có 36 lớp, `head_dim=128`, hidden size 2560 và embedding/head dùng chung (`tie_word_embeddings=true`). Backbone có **4.022.468.096 tham số độc lập**, LoRA thêm **33.030.144**, tổng **4.055.498.240 < 8B**; backbone FP16 khoảng **7,49 GiB**. FSDP giữ embedding/head dùng chung frozen trên mỗi rank và shard decoder; cần đo activation/peak VRAM thực tế trên T4 x2.
-- Dùng chat template chính thức có generation prefix `<think>`. SFT dùng `cot` tham chiếu trong block thinking và trong `explanation` của JSON cuối. Mask prompt, học phần assistant bằng teacher forcing. API chỉ trả JSON cuối, `reasoning=null`; self-consistency vẫn 5 mẫu.
-- `max_length=3072` để chứa block thinking cùng JSON, `max_new_tokens=1500` tính cả thinking và JSON; serving giới hạn context 4096 và deadline 55 giây. Mẫu quá dài dừng báo lỗi, không bị cắt ngầm. Thinking dài có thể hết token/deadline trước khi tới JSON; chưa đo chất lượng hoặc latency với backbone mới.
+- Dùng chat template chính thức ở chế độ instruct, không có generation prefix `<think>`. SFT đưa `cot` một lần vào trường `explanation` của JSON cuối; mask prompt và học phần assistant bằng teacher forcing. API trả JSON, `reasoning=null`; self-consistency vẫn 5 mẫu.
+- `max_length=2048` chứa system prompt, câu hỏi và JSON lời giải trực tiếp; `max_new_tokens=1500` giới hạn output khi inference. Serving giới hạn context 4096 và deadline 55 giây. Mẫu quá dài dừng báo lỗi, không bị cắt ngầm.
 
-Adapter Qwen2.5 cũ không tương thích Qwen3. Train lại trong output mới `/kaggle/working/vipra_qwen3_4b_thinking_2507_5epochs`, rồi dùng `submission.prepare` với deployment mới. Deployment/adapter đang có được giữ để chạy lại checkpoint cũ; registry vẫn nhận đúng model/revision cũ, không gắn adapter đó vào Qwen3.
+Adapter Qwen2.5 cũ không tương thích Qwen3. Train lại trong output mới `/kaggle/working/vipra_qwen3_4b_instruct_2507_5epochs`, rồi dùng `submission.prepare` với deployment mới. Deployment/adapter đang có được giữ để chạy lại checkpoint cũ; registry vẫn nhận đúng model/revision cũ, không gắn adapter đó vào Qwen3.
 
 
 Clone nhánh `Nhotest` trên Kaggle:
@@ -49,7 +49,7 @@ Sau khi clone repo về chạy lần lượt:
 
 ```python
 !python -m baseline.check
-!python -m baseline.experiment --output-dir /kaggle/working/vipra_qwen3_4b_thinking_2507_train_dev01
+!python -m baseline.experiment --output-dir /kaggle/working/vipra_qwen3_4b_instruct_2507_train_dev01
 ```
 
 ## Train đầy đủ, validation trên dev, lưu best checkpoint
@@ -82,7 +82,7 @@ Lệnh evaluate riêng dùng model chia lớp trong một tiến trình, không 
 Launcher tự tạo 2 worker FSDP song song, một worker/GPU. Mỗi cấu hình dùng thư mục output mới. `baseline.train` CLI mặc định gọi cùng workflow. Notebook hiển thị điểm dev đã lưu của best epoch; không tự sinh lại dev thêm lần nữa. Có thể gọi riêng lệnh dưới để đo lại thời gian từng câu; đây vẫn là điểm trên tập validation đã dùng chọn model, không phải test độc lập:
 
 ```python
-!python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen3_4b_thinking_2507_train_dev01
+!python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen3_4b_instruct_2507_train_dev01
 ```
 
 ## Thực nghiệm nhiều learning rate và giới hạn sinh
@@ -122,7 +122,7 @@ Nếu LR/grid/base config hoặc hash train/dev thay đổi thì phải dùng ou
 Đổi lưới qua `--grid-config <file.json>`; baseline đơn lẻ vẫn dùng `python -m baseline.experiment`.
 Notebook mặc định chạy sweep và hiển thị best trial, không tự đánh giá lại dev.
 
-Qwen3-4B-Thinking-2507 chỉ hỗ trợ thinking; template tự mở `<think>`, không cần `enable_thinking`. Nhãn SFT dùng lời giải tham chiếu trước `</think>` và JSON cuối. Đây là lời giải từ CSV, không phải dữ liệu thinking do teacher model tạo thêm. Parser bỏ block thinking đã đóng rồi kiểm tra JSON; mẫu chưa hoàn tất bị loại khỏi bỏ phiếu. Validation loss vẫn dùng teacher forcing; chấm đáp án dùng model tự sinh.
+Qwen3-4B-Instruct-2507 chỉ hỗ trợ non-thinking; template không tự mở `<think>`. Nhãn SFT dùng lời giải tham chiếu một lần trong trường `explanation` của JSON. Parser kiểm tra trực tiếp JSON; mẫu chưa hoàn tất bị loại khỏi bỏ phiếu. Validation loss vẫn dùng teacher forcing; chấm đáp án dùng model tự sinh.
 
 ## Chạy song song và tái lập
 
@@ -217,4 +217,4 @@ Kiểm tra CPU (model Qwen2 nhỏ, gồm hai tiến trình FSDP thật với Glo
 python -m unittest discover -s tests -v
 ```
 
-Nguồn: [PyTorch FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), [Qwen3-4B-Thinking-2507 model card](https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507), [Qwen3 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen3), [PyTorch SDPA và độ chính xác](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).
+Nguồn: [PyTorch FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html), [Qwen3-4B-Instruct-2507 model card](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507), [Qwen3 trong Transformers](https://huggingface.co/docs/transformers/en/model_doc/qwen3), [PyTorch SDPA và độ chính xác](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html), [PEFT LoRA](https://huggingface.co/docs/peft/en/package_reference/lora), [LoRA paper](https://arxiv.org/abs/2106.09685).
