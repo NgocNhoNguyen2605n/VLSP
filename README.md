@@ -28,7 +28,7 @@ Baseline: `Qwen/Qwen3-4B-Instruct-2507`, backbone FP16, **LoRA thuần**, không
 - Train **5 epoch với seed 42**, xuất checkpoint epoch 5 (`fixed_epoch`). Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
 - Kiến trúc Qwen3 có 36 lớp, `head_dim=128`, hidden size 2560 và embedding/head dùng chung (`tie_word_embeddings=true`). Backbone có **4.022.468.096 tham số độc lập**, LoRA thêm **33.030.144**, tổng **4.055.498.240 < 8B**; backbone FP16 khoảng **7,49 GiB**. FSDP giữ embedding/head dùng chung frozen trên mỗi rank và shard decoder; cần đo activation/peak VRAM thực tế trên T4 x2.
 - Dùng chat template chính thức ở chế độ instruct, không có generation prefix `<think>`. SFT đưa `cot` một lần vào trường `explanation` của JSON cuối; mask prompt và học phần assistant bằng teacher forcing. API trả JSON, `reasoning=null`; self-consistency vẫn 5 mẫu.
-- `max_length=2048` chứa system prompt, câu hỏi và JSON lời giải trực tiếp; `max_new_tokens=1500` giới hạn output khi inference. Serving giới hạn context 4096 và deadline 55 giây. Mẫu quá dài dừng báo lỗi, không bị cắt ngầm.
+- `max_length=1700` chứa system prompt, câu hỏi và JSON lời giải trực tiếp; `max_new_tokens=1500` giới hạn output khi inference. Mẫu dev dài nhất hiện đo được là 1671 token; mẫu vượt giới hạn sẽ dừng báo lỗi, không bị cắt ngầm.
 
 Adapter Qwen2.5 cũ không tương thích Qwen3. Train lại trong output mới `/kaggle/working/vipra_qwen3_4b_instruct_2507_5epochs`, rồi dùng `submission.prepare` với deployment mới. Deployment/adapter đang có được giữ để chạy lại checkpoint cũ; registry vẫn nhận đúng model/revision cũ, không gắn adapter đó vào Qwen3.
 
