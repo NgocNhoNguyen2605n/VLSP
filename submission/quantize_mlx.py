@@ -31,14 +31,14 @@ def main():
     if snapshot.name != revision:
         raise ValueError("Tên snapshot không khớp revision training.")
     config = json.loads((snapshot / "config.json").read_text())
-    if config.get("model_type") != "qwen2":
-        raise ValueError("Không phải kiến trúc Qwen2 của checkpoint.")
+    if config.get("model_type") not in ("qwen2", "qwen3"):
+        raise ValueError("Không phải kiến trúc Qwen2/Qwen3 của checkpoint.")
     output = Path(args.output).resolve()
     if output.exists():
         raise FileExistsError(output)
     import mlx.core as mx
     from mlx_lm.convert import convert
-    # Chuyển đổi trên CPU để không nạp toàn bộ backbone 7B FP16 vào GPU 16 GiB.
+    # Chuyển đổi trên CPU để không nạp toàn bộ backbone FP16 vào GPU 16 GiB.
     mx.set_default_device(mx.cpu)
     convert(str(snapshot), mlx_path=str(output), quantize=True, q_bits=4,
             q_group_size=64, q_mode="affine", dtype="float16", trust_remote_code=False)

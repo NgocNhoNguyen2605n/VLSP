@@ -8,12 +8,13 @@ from urllib.parse import urlsplit
 
 from baseline.consistency import decoding_settings
 
-BASE_MODEL = "Qwen/Qwen2.5-Math-7B-Instruct"
-REVISION = "ef9926d75ab1d54532f6a30dd5e760355eb9aa4d"
-BASE_PARAMETERS = 7_615_616_512
-DEFAULT_MODEL_NAME = "Viper-Qwen2.5-Math-7B-LoRA"
+BASE_MODEL = "Qwen/Qwen3-4B-Thinking-2507"
+REVISION = "768f209d9ea81521153ed38c47d515654e938aea"
+BASE_PARAMETERS = 4_022_468_096
+DEFAULT_MODEL_NAME = "Viper-Qwen3-4B-Thinking-2507-LoRA"
 SUPPORTED_BACKBONES = {
     BASE_MODEL: (REVISION, BASE_PARAMETERS),
+    "Qwen/Qwen2.5-Math-7B-Instruct": ("ef9926d75ab1d54532f6a30dd5e760355eb9aa4d", 7_615_616_512),
     "Qwen/Qwen2.5-3B-Instruct": ("aa8e72537993ba99e69dfaafa59ed015b17504d1", 3_085_938_688),
 }
 
@@ -26,7 +27,7 @@ class ServingConfig:
     model_name: str = DEFAULT_MODEL_NAME
     adapter_path: str | None = None
     backend_url: str = "http://127.0.0.1:8000"
-    max_new_tokens: int = 300
+    max_new_tokens: int = 1500
     request_deadline_seconds: float = 55
     seed: int = 42
     self_consistency_samples: int = 5

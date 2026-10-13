@@ -76,7 +76,7 @@ def create_report(train_file, dev_file, output, deployment=None, font=None, bold
     add("2. Method", "head")
     cfg = provenance["training_config"] if provenance else json.loads((Path(__file__).resolve().parents[1] / "configs/baseline.json").read_text(encoding="utf-8"))
     epoch = provenance["adapter_epoch"] if provenance else cfg["selected_epoch"]
-    add(f"{model_id.split('/')[-1]} uses its official chat template. Supervised fine-tuning maps each question to one JSON object containing explanation, answer, unit and reasoning=null. Teacher forcing learns only assistant tokens. Training uses FP16 frozen backbone, FP32 LoRA, seed {cfg['seed']} and {cfg['epochs']} epochs; FSDP2 distributes training across GPUs. The exported adapter is epoch {epoch} ({escape(str(cfg.get('checkpoint_selection', 'answer_accuracy')))} selection).")
+    add(f"{model_id.split('/')[-1]} uses its official chat template. Supervised fine-tuning maps each question to one JSON object containing explanation, answer, unit and reasoning=null. For Qwen3 Thinking, the reference explanation also supervises the thinking block before the final JSON. Teacher forcing learns only assistant tokens. Training uses FP16 frozen backbone, FP32 LoRA, seed {cfg['seed']} and {cfg['epochs']} epochs; FSDP2 distributes training across GPUs. The exported adapter is epoch {epoch} ({escape(str(cfg.get('checkpoint_selection', 'answer_accuracy')))} selection).")
     precision = ("The backbone is converted from the pinned revision to MLX affine 4-bit (group size 64); LoRA is applied separately through vLLM Metal on Apple Silicon. "
                  if provenance and provenance.get("inference_precision") == "mlx-4bit" else "")
     serving = json.loads((Path(deployment) / "serving.json").read_text()) if deployment else cfg
@@ -86,8 +86,12 @@ def create_report(train_file, dev_file, output, deployment=None, font=None, bold
                 if settings["samples"] > 1 else "greedy decoding generates one explanation and answer")
     add(f"Inference runs one self-hosted vLLM engine with the selected LoRA. {precision}The official chat template is retained; {decoding}, at most {serving['max_new_tokens']} new tokens per sample. The API attaches query_id, normalizes units to ASCII, and returns one JSON result. No answer labels, retrieval, external solver or third-party inference API are used at prediction time.")
     add("3. Models and capacity", "head")
-    # Qwen2.5-Math-7B: 28 lớp, tổng (in + out) của 7 projection/lớp = 90,112.
-    adapter = provenance["adapter_parameters"] if provenance else cfg["lora_rank"] * 28 * 90_112
+    # Tổng (in + out) của 7 projection, gồm GQA và head_dim riêng của Qwen3.
+    profiles = {"Qwen/Qwen3-4B-Thinking-2507": (36, 57_344),
+                "Qwen/Qwen2.5-Math-7B-Instruct": (28, 90_112),
+                "Qwen/Qwen2.5-3B-Instruct": (36, 51_968)}
+    layers, projection_sum = profiles[model_id]
+    adapter = provenance["adapter_parameters"] if provenance else cfg["lora_rank"] * layers * projection_sum
     total = base_parameters + adapter
     add(f"Only LLM: {model_id} ({base_parameters:,} parameters), plus LoRA ({adapter:,} parameters). Conservative total: {base_parameters:,} + {adapter:,} = {total:,} &lt; 8,000,000,000. vLLM model cards for the backbone and LoRA refer to one shared backbone instance. No other LLM is loaded for this solution.")
     add("4. Serving contract", "head")

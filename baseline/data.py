@@ -16,7 +16,7 @@ SYSTEM = """Giải bài toán vật lý tiếng Việt.
 - Kiểm tra kết quả khớp công thức, dấu và đơn vị.
 
 ## Đầu ra
-- Chỉ trả một JSON object, không bọc Markdown, với các trường theo thứ tự: explanation, answer, unit, reasoning.
+- Phần trả lời cuối chỉ chứa một JSON object, không bọc Markdown, với các trường theo thứ tự: explanation, answer, unit, reasoning.
 - explanation, answer và unit là chuỗi; reasoning là null.
 - answer chỉ chứa kết quả, không kèm đơn vị hoặc lời dẫn; câu định tính dùng kết luận ngắn.
 - Số thập phân dùng dấu '.', số mũ có thể dùng e.
@@ -116,12 +116,26 @@ def prompt_ids(tokenizer, question):
                                          return_dict=False)
 
 
+def is_thinking_tokenizer(tokenizer):
+    """Nhận biết generation prefix chính thức, không sửa chat template."""
+    prefix = tokenizer.apply_chat_template(prompt_messages(""), tokenize=False,
+                                           add_generation_prompt=True)
+    return isinstance(prefix, str) and prefix.rstrip().endswith("<think>")
+
+
 def encode_sample(tokenizer, row, max_length):
     """Mask prompt bằng -100; chỉ học câu trả lời, không cắt ngầm mẫu dài."""
     target = {"explanation": row["cot"], "answer": row["answer"],
               "unit": row["unit"], "reasoning": None}
+    content = json.dumps(target, ensure_ascii=False)
+    # Template Qwen3 Thinking tự mở <think> trong generation prefix.
+    # Dùng lời giải tham chiếu làm phần reasoning SFT, giữ JSON cuối cho API.
+    if is_thinking_tokenizer(tokenizer):
+        if any(tag in row["cot"] for tag in ("<think>", "</think>")):
+            raise ValueError(f"{row['id']}: cot chứa thẻ think dành riêng cho template.")
+        content = "<think>\n" + row["cot"] + "\n</think>\n\n" + content
     messages = prompt_messages(row["question"]) + [
-        {"role": "assistant", "content": json.dumps(target, ensure_ascii=False)}]
+        {"role": "assistant", "content": content}]
     prefix = prompt_ids(tokenizer, row["question"])
     full = tokenizer.apply_chat_template(messages, tokenize=True,
                                          add_generation_prompt=False,

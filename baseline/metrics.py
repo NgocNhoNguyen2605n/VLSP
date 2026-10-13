@@ -74,6 +74,14 @@ def numeric_value(value):
 def parse_prediction(text):
     """Đọc một JSON object; cho phép xuống dòng/tab trong chuỗi, giữ nội dung."""
     text = text.strip()
+    # Generation prefix Qwen3 đã chứa <think>, nên raw có thể chỉ có </think>.
+    # Chỉ đọc JSON cuối sau block đã đóng; không nhặt JSON trong reasoning.
+    if "</think>" in text:
+        if text.count("</think>") != 1:
+            return None
+        text = text.split("</think>", 1)[1].strip()
+    if "<think>" in text:
+        return None
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
     try:
