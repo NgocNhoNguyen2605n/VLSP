@@ -13,7 +13,7 @@
   "dev_file": null,
   "output_dir": "/kaggle/working/vipra_qwen3_4b_thinking_2507_5epochs",
   "skip_missing_answer": false,
-  "max_length": 3700,
+  "max_length": 3072,
   "epochs": 5,
   "checkpoint_selection": "fixed_epoch",
   "selected_epoch": 5,
