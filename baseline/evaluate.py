@@ -215,11 +215,14 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
     if manifest.get("training_status", "complete") != "complete":
         raise RuntimeError("Train chưa hoàn tất; không chấm adapter của lần chạy đang dở.")
     cfg = manifest["config"].copy()
-    for key, value, default in (("self_consistency_samples", self_consistency_samples, 5),
+    for key, value, default in (("self_consistency_samples", self_consistency_samples, 1),
                                 ("sampling_temperature", sampling_temperature, 0.7),
                                 ("sampling_top_p", sampling_top_p, 0.8)):
         if value is not None:
             cfg[key] = value
+        elif key == "self_consistency_samples":
+            # Evaluation defaults to greedy even when an older run manifest recorded SC5.
+            cfg[key] = default
         else:
             cfg.setdefault(key, default)
     decoding = decoding_settings(cfg)
@@ -268,7 +271,7 @@ def main():
     parser.add_argument("--train-file")
     parser.add_argument("--dev-file")
     parser.add_argument("--test-file", help="CSV test có nhãn; sau dev sẽ được chấm ở phase test")
-    parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu/câu; mặc định run hoặc 5, dùng 1 để so greedy")
+    parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu/câu; mặc định run hoặc 1 (greedy)")
     parser.add_argument("--sampling-temperature", type=float)
     parser.add_argument("--sampling-top-p", type=float)
     args = parser.parse_args()

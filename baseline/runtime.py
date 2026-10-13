@@ -28,7 +28,7 @@ def arguments(description):
 def read_config(args):
     """Nạp cấu hình và kiểm tra các giới hạn quan trọng."""
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
-    cfg.setdefault("self_consistency_samples", 5)
+    cfg.setdefault("self_consistency_samples", 1)
     cfg.setdefault("sampling_temperature", 0.7)
     cfg.setdefault("sampling_top_p", 0.8)
     decoding_settings(cfg)

@@ -31,7 +31,7 @@ class ServingConfig:
     max_new_tokens: int = 1500
     request_deadline_seconds: float = 55
     seed: int = 42
-    self_consistency_samples: int = 5
+    self_consistency_samples: int = 1
     sampling_temperature: float = 0.7
     sampling_top_p: float = 0.8
     max_model_len: int = 4096

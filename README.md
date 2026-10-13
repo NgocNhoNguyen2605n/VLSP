@@ -27,7 +27,7 @@ Baseline: `Qwen/Qwen3-4B-Instruct-2507`, backbone FP16, **LoRA thuần**, không
 
 - Train **5 epoch với seed 42**, xuất checkpoint epoch 5 (`fixed_epoch`). Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
 - Kiến trúc Qwen3 có 36 lớp, `head_dim=128`, hidden size 2560 và embedding/head dùng chung (`tie_word_embeddings=true`). Backbone có **4.022.468.096 tham số độc lập**, LoRA thêm **33.030.144**, tổng **4.055.498.240 < 8B**; backbone FP16 khoảng **7,49 GiB**. FSDP giữ embedding/head dùng chung frozen trên mỗi rank và shard decoder; cần đo activation/peak VRAM thực tế trên T4 x2.
-- Dùng chat template chính thức ở chế độ instruct, không có generation prefix `<think>`. SFT đưa `cot` một lần vào trường `explanation` của JSON cuối; mask prompt và học phần assistant bằng teacher forcing. API trả JSON, `reasoning=null`; self-consistency vẫn 5 mẫu.
+- Dùng chat template chính thức ở chế độ instruct, không có generation prefix `<think>`. SFT đưa `cot` một lần vào trường `explanation` của JSON cuối; mask prompt và học phần assistant bằng teacher forcing. API trả JSON, `reasoning=null`; inference mặc định greedy, sinh một đáp án mỗi câu.
 - `max_length=1700` chứa system prompt, câu hỏi và JSON lời giải trực tiếp; `max_new_tokens=1500` giới hạn output khi inference. Mẫu dev dài nhất hiện đo được là 1671 token; mẫu vượt giới hạn sẽ dừng báo lỗi, không bị cắt ngầm.
 
 Adapter Qwen2.5 cũ không tương thích Qwen3. Train lại trong output mới `/kaggle/working/vipra_qwen3_4b_instruct_2507_5epochs`, rồi dùng `submission.prepare` với deployment mới. Deployment/adapter đang có được giữ để chạy lại checkpoint cũ; registry vẫn nhận đúng model/revision cũ, không gắn adapter đó vào Qwen3.
@@ -75,7 +75,7 @@ Với `fixed_epoch`, chỉ tính loss nên không vào chế độ giữ trọng
 Lệnh evaluate riêng dùng model chia lớp trong một tiến trình, không dùng FSDP2.
 
 1. Dùng toàn bộ **677 mẫu train** trong `train_dataset.csv` để học. **339 mẫu `dev_dataset.csv`** dùng validation; không chia lại train, không đưa dev vào optimizer. `split.json` chỉ ghi hash và ID của hai CSV riêng để worker kiểm tra đúng dữ liệu.
-2. Khởi tạo backbone gốc + LoRA mới, train **5 epoch với seed 42**. Với `answer_accuracy`, sau mỗi epoch tính dev loss và sinh 5 mẫu/câu theo batch 4 (`validation_batch_size=4`), lưu checkpoint + predictions + metrics. Dev 339 câu có **85 batch generation/epoch** (batch cuối 3 câu). Một batch 4 câu có 20 chuỗi ứng viên; giảm `validation_batch_size` nếu thiếu VRAM. Hai rank cùng xử lý một batch 4 câu, không phải 4 câu riêng/GPU.
+2. Khởi tạo backbone gốc + LoRA mới, train **5 epoch với seed 42**. Với `answer_accuracy`, sau mỗi epoch tính dev loss và sinh một mẫu/câu theo batch 4 (`validation_batch_size=4`), lưu checkpoint + predictions + metrics. Dev 339 câu có **85 batch generation/epoch** (batch cuối 3 câu). Hai rank cùng xử lý một batch 4 câu, không phải 4 câu riêng/GPU.
 3. Chọn epoch theo **content_tolerant accuracy** (đáp án + đơn vị). Nếu hòa: content_exact cao hơn, dev loss thấp hơn, epoch sớm hơn. Không dùng timeout để xếp hạng. Dung sai mặc định `rtol=0.05, atol=0` (5% theo đáp án chuẩn).
 4. Xuất đúng checkpoint thắng vào **`RUN_DIR/adapter`**, kèm tokenizer và `RUN_DIR/run.json`. Nếu epoch 3 thắng thì adapter xuất ra lấy trọng số epoch 3, dù đã train đủ 5 epoch. **Không retrain**, không nạp lại backbone sau bước chọn. `selection.json` lưu điểm cả 5 epoch và checkpoint thắng, `experiment.json` chuyển sang `complete`.
 
@@ -144,30 +144,24 @@ Qwen3-4B-Instruct-2507 chỉ hỗ trợ non-thinking; template không tự mở 
 
 ## Đánh giá và độ ổn định
 
-Inference mặc định dùng **self-consistency 5**: `self_consistency_samples=5`,
-`sampling_temperature=0.7`, `sampling_top_p=0.8`.
-Transformers sinh 5 chuỗi/câu trong cùng một lượt `generate`; vLLM nhận `n=5` trong một request.
-Mẫu không hoàn tất, JSON lỗi hoặc số phần answer/unit không khớp bị loại.
-Bỏ phiếu trên toàn bộ tuple đáp án và đơn vị, không bỏ phiếu từng phần rồi ghép lời giải.
-Biểu diễn số tương đương được gộp (12 chữ số có nghĩa); chuẩn hóa alias đơn vị ASCII,
-không đổi thang đơn vị và không dùng dung sai chấm 5% để gộp phiếu.
-Nhóm nhiều phiếu nhất thắng; hòa lấy mẫu xuất hiện trước trong các nhóm hòa.
-Trả nguyên đáp án/lời giải của mẫu thắng, không lấy trung bình đáp án và không sinh thêm lượt.
-`predictions.jsonl`/log API ghi các ứng viên, số phiếu, trạng thái hòa và có đa số hay không.
-`generated_tokens` của evaluation là tổng token của các ứng viên cho câu đó.
+Inference mặc định dùng **greedy**: `self_consistency_samples=1`.
+Transformers/vLLM sinh một chuỗi/câu với `do_sample=false`, `temperature=0` và `top_p=1`;
+không bỏ phiếu và không sinh thêm lượt.
+Chế độ self-consistency vẫn có thể bật khi cần bằng cách đặt `self_consistency_samples>1`;
+khi đó API mới sinh nhiều candidate và bỏ phiếu trên tuple đáp án/đơn vị.
+`predictions.jsonl`/log API ghi candidate đã chọn và cấu hình decoding.
 `fixed_epoch` vẫn chỉ tính validation loss, không chạy sampling/bỏ phiếu.
 
 Deadline API **55 giây cho toàn bộ request**, không phải 55 giây/mẫu.
 Deadline generation offline áp dụng cho cả batch gồm các ứng viên;
 thời gian báo cáo gồm generation, decode và bỏ phiếu.
 `/healthz` công bố cấu hình decoding để evaluation API phát hiện thay đổi giữa run.
-Checkpoint cũ không có các trường sampling sẽ mặc định dùng 5 mẫu khi gọi evaluate hoặc prepare.
-Để so greedy, dùng `--self-consistency-samples 1` khi evaluate hoặc đặt
-`self_consistency_samples=1` trong serving config. Restart API sau khi đổi config/prompt.
+Checkpoint cũ không có các trường sampling sẽ mặc định dùng một mẫu khi gọi evaluate hoặc prepare.
+Restart API sau khi đổi config/prompt.
 
 ```bash
-python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_SC5 --self-consistency-samples 5
 python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_GREEDY --self-consistency-samples 1
+python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_SC5 --self-consistency-samples 5
 ```
 
 - Attention dùng **SDPA math**, giữ trung gian FP32 để tránh QK^T tràn FP16 trước softmax. Tắt reduced-precision reduction của GEMM FP16. Trọng số backbone vẫn FP16; không yêu cầu FlashAttention/BF16 trên T4. SDPA math có thể tăng thời gian và VRAM so với các kernel fused.
@@ -177,7 +171,7 @@ python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_GREEDY --self
 - Run mới phải hiện `train=677, validation(dev)=339`. Nếu còn `608/68` hoặc `676/0`, cập nhật nhánh `Nhotest`, dùng notebook mới và chọn output mới. Evaluate trỏ vào thư mục experiment; nó dùng `RUN_DIR/adapter` của best epoch.
 - `content_exact`: chuỗi đáp án khớp sau NFC/khoảng trắng, đơn vị khớp sau các alias ASCII đã khai báo.
 - `content_tolerant`: cho phép biểu thức số an toàn và `abs(pred-gold) <= atol + rtol*abs(gold)`. Mặc định **rtol=0,05, atol=0**; không coi đáp án rất nhỏ là 0. Dung sai này không phải quy định BTC.
-- `p1_estimate`: content đúng và trả kết quả trong giới hạn thời gian. Mỗi câu một lượt generation gồm 5 mẫu, bỏ phiếu, không retry. Deadline dừng ở ranh giới token; câu thực tế vượt 60 giây vẫn bị tính sai. Đây là deadline generation, chưa bao gồm thời gian gọi API bên ngoài; một bước GPU đang chạy có thể làm thời gian thực tế vượt deadline.
+- `p1_estimate`: content đúng và trả kết quả trong giới hạn thời gian. Mặc định mỗi câu một lượt greedy generation, không retry. Deadline dừng ở ranh giới token; câu thực tế vượt 60 giây vẫn bị tính sai. Đây là deadline generation, chưa bao gồm thời gian gọi API bên ngoài; một bước GPU đang chạy có thể làm thời gian thực tế vượt deadline.
 
 Kết quả trong thư mục experiment:
 

@@ -5,7 +5,7 @@
   "gpu_count": 2,
   "parallel_training": "fsdp",
   "seed": 42,
-  "self_consistency_samples": 5,
+  "self_consistency_samples": 1,
   "sampling_temperature": 0.7,
   "sampling_top_p": 0.8,
   "data_root": "/kaggle/input",
