@@ -1,6 +1,6 @@
-"""Sinh và bỏ phiếu đáp án dev; báo P1 ước lượng, không dùng API."""
+"""Sinh và bỏ phiếu đáp án dev rồi test; không dùng API."""
 
-from .runtime import environment, save_json, setup_seed  # Seed, môi trường và báo cáo.
+from .runtime import environment, fingerprint, save_json, setup_seed  # Seed, môi trường và báo cáo.
 
 import argparse  # Chọn thư mục adapter và kết quả.
 import hashlib  # Kiểm tra template giống lúc train.
@@ -11,7 +11,7 @@ from pathlib import Path  # Đọc manifest và lưu JSONL.
 import torch  # Inference không gradient, dùng FP16 trên hai GPU.
 from transformers import GenerationConfig, StoppingCriteria, StoppingCriteriaList  # Greedy và deadline.
 
-from .data import load_data, prompt_ids  # Prompt chỉ có câu hỏi.
+from .data import find_csv, load_csv, load_data, prompt_ids  # Prompt chỉ có câu hỏi.
 from .consistency import decoding_settings, select_consistent
 from .metrics import canonical_text, parse_prediction, score_prediction  # Evaluator P1 tạm thời.
 from .model import load_model, load_tokenizer  # Nạp backbone và adapter đã lưu.
@@ -103,9 +103,101 @@ def generate_batch(model, tokenizer, questions, cfg, diagnostics=None):
     return [(raw, elapsed, tokens, finished) for raw, _, tokens, finished in results]
 
 
+def load_test_data(cfg, test_file=None):
+    """Nạp test có nhãn nếu được truyền rõ hoặc tìm thấy đúng một test_dataset.csv."""
+    explicit = test_file or cfg.get("test_file")
+    if explicit:
+        path = find_csv(cfg["data_root"], "test", explicit)
+    else:
+        root = Path(cfg["data_root"]).expanduser()
+        if not root.is_dir():
+            return None, None
+        matches = sorted(p.resolve() for p in root.rglob("test_dataset.csv")
+                         if p.is_file() and "__MACOSX" not in p.parts)
+        if not matches:
+            return None, None
+        if len(matches) != 1:
+            raise ValueError(f"Tìm thấy {len(matches)} file test_dataset.csv trong {root}. "
+                             "Hãy truyền --test-file.")
+        path = matches[0]
+    rows, skipped = load_csv(path, "test", skip_missing_answer=False)
+    return rows, {"path": str(path), "sha256": fingerprint(path),
+                  "samples": len(rows), "skipped_ids": skipped}
+
+
+def evaluate_split(model, tokenizer, rows, split_name, result_dir, cfg, decoding,
+                   train_questions, data_info):
+    """Chấm một split, lưu prediction/metrics và in accuracy theo số câu."""
+    result_dir = Path(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    counts = {"total": len(rows), "valid_json": 0, "content_exact": 0,
+              "content_tolerant": 0, "p1_estimate": 0, "over_time": 0,
+              "unfinished_generation": 0, "unsupported_symbolic": 0,
+              "overlap_samples": 0, "overlap_correct": 0, "unseen_correct": 0}
+    label = split_name.capitalize()
+    print(f"Evaluate {split_name} {counts['total']} câu | samples={decoding['samples']} | seed={cfg['seed']} | "
+          f"rtol={cfg['rtol']}, atol={cfg['atol']} (tạm thời).", flush=True)
+    with (result_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
+        for index, row in enumerate(rows, start=1):
+            diagnostics = []
+            raw, elapsed, token_count, finished = generate_once(model, tokenizer, row["question"], cfg,
+                                                                  diagnostics=diagnostics)
+            prediction = parse_prediction(raw)
+            if prediction is not None:
+                prediction["query_id"] = row["id"]
+            score = score_prediction(prediction, row, cfg["rtol"], cfg["atol"])
+            timed_out = elapsed > cfg["timeout_seconds"]
+            correct = score["tolerant"] and not timed_out
+            overlap = canonical_text(row["question"]) in train_questions
+            counts["valid_json"] += prediction is not None
+            counts["content_exact"] += score["exact"]
+            counts["content_tolerant"] += score["tolerant"]
+            counts["p1_estimate"] += correct
+            counts["over_time"] += timed_out
+            counts["unfinished_generation"] += not finished
+            counts["unsupported_symbolic"] += score["unsupported_symbolic"]
+            counts["overlap_samples"] += overlap
+            counts["overlap_correct"] += overlap and correct
+            counts["unseen_correct"] += not overlap and correct
+            record = {"query_id": row["id"], "prediction": prediction, "raw_output": raw,
+                      "gold_answer": row["answer"], "gold_unit": row["unit"],
+                      "seconds": elapsed, "generated_tokens": token_count, "finished": finished,
+                      "score": score, "over_time": timed_out,
+                      "p1_estimate_correct": correct, "overlap_train": overlap,
+                      "self_consistency": diagnostics[0] if diagnostics else None}
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            if index % 25 == 0 or index == counts["total"]:
+                accuracy = counts["p1_estimate"] / index
+                print(f"{label} {index}/{counts['total']} | đúng={counts['p1_estimate']} | "
+                      f"accuracy={counts['p1_estimate']}/{index}={accuracy:.2%}", flush=True)
+    accuracy = counts["p1_estimate"] / counts["total"]
+    summary = {**counts, "evaluated": counts["total"], "accuracy": accuracy,
+               "accuracy_estimate": accuracy, "rtol": cfg["rtol"], "atol": cfg["atol"],
+               "timeout_seconds": cfg["timeout_seconds"], "decoding": decoding,
+               "official_metric": False, "environment": environment(), "data": data_info,
+               "split": split_name,
+               "notes": ["BTC chưa công bố dung sai và evaluator chính thức.",
+                         "Accuracy = số câu đúng theo content_tolerant và không quá thời gian / số câu đã evaluate.",
+                         "Exact: chuỗi đáp án sau NFC/khoảng trắng + đơn vị alias ASCII.",
+                         "Tolerant: biểu thức số an toàn; không đổi thang đơn vị, không suy luận tương đương biểu thức có biến.",
+                         "Không chấm chất lượng explanation; yêu cầu explanation không rỗng.",
+                         "Mẫu quá thời gian bị tính sai; deadline chỉ dừng ở ranh giới token."]}
+    if split_name == "dev":
+        summary["notes"].append("Dev đã dùng chọn checkpoint; điểm này là validation, không phải test độc lập.")
+    else:
+        summary["notes"].append("Test được chấm sau khi hoàn tất phase dev; không dùng để chọn checkpoint.")
+    save_json(result_dir / "metrics.json", summary)
+    print(f"{label} accuracy: {counts['p1_estimate']}/{counts['total']} = {accuracy:.2%} | "
+          f"content đúng={counts['content_tolerant']} | JSON hợp lệ={counts['valid_json']} | "
+          f"quá thời gian={counts['over_time']}. Kết quả: {result_dir}", flush=True)
+    return summary
+
+
 def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file=None,
-             self_consistency_samples=None, sampling_temperature=None, sampling_top_p=None):
-    """Chấm mọi dòng dev; báo riêng content đúng và đúng trong giới hạn thời gian."""
+             self_consistency_samples=None, sampling_temperature=None, sampling_top_p=None,
+             test_file=None):
+    """Chấm dev trước, sau đó chấm test có nhãn nếu có đường dẫn hoặc file tự tìm thấy."""
     run_dir = Path(run_dir)
     if (run_dir / "experiment.json").is_file():
         experiment = json.loads((run_dir / "experiment.json").read_text(encoding="utf-8"))
@@ -151,76 +243,38 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
     model, _ = load_model(cfg, adapter=run_dir / "adapter")
     result_dir.mkdir(parents=True, exist_ok=True)
     train_questions = {canonical_text(row["question"]) for row in splits["train"]}
-    counts = {"total": len(splits["dev"]), "valid_json": 0, "content_exact": 0,
-              "content_tolerant": 0, "p1_estimate": 0, "over_time": 0,
-              "unfinished_generation": 0, "unsupported_symbolic": 0,
-              "overlap_samples": 0, "overlap_correct": 0, "unseen_correct": 0}
-    print(f"Evaluate {counts['total']} câu | samples={decoding['samples']} | seed={cfg['seed']} | "
-          f"rtol={cfg['rtol']}, atol={cfg['atol']} (tạm thời).", flush=True)
-    with (result_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
-        for index, row in enumerate(splits["dev"], start=1):
-            diagnostics = []
-            raw, elapsed, token_count, finished = generate_once(model, tokenizer, row["question"], cfg,
-                                                              diagnostics=diagnostics)
-            prediction = parse_prediction(raw)
-            if prediction is not None:
-                prediction["query_id"] = row["id"]
-            score = score_prediction(prediction, row, cfg["rtol"], cfg["atol"])
-            timed_out = elapsed > cfg["timeout_seconds"]
-            correct = score["tolerant"] and not timed_out
-            overlap = canonical_text(row["question"]) in train_questions
-            counts["valid_json"] += prediction is not None
-            counts["content_exact"] += score["exact"]
-            counts["content_tolerant"] += score["tolerant"]
-            counts["p1_estimate"] += correct
-            counts["over_time"] += timed_out
-            counts["unfinished_generation"] += not finished
-            counts["unsupported_symbolic"] += score["unsupported_symbolic"]
-            counts["overlap_samples"] += overlap
-            counts["overlap_correct"] += overlap and correct
-            counts["unseen_correct"] += not overlap and correct
-            record = {"query_id": row["id"], "prediction": prediction, "raw_output": raw,
-                      "gold_answer": row["answer"], "gold_unit": row["unit"],
-                      "seconds": elapsed, "generated_tokens": token_count, "finished": finished,
-                      "score": score, "over_time": timed_out,
-                      "p1_estimate_correct": correct, "overlap_train": overlap,
-                      "self_consistency": diagnostics[0] if diagnostics else None}
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            handle.flush()
-            if index % 25 == 0 or index == counts["total"]:
-                print(f"Dev {index}/{counts['total']} | đúng ước lượng={counts['p1_estimate']}", flush=True)
-    summary = {**counts, "accuracy_estimate": counts["p1_estimate"] / counts["total"],
-               "rtol": cfg["rtol"], "atol": cfg["atol"], "timeout_seconds": cfg["timeout_seconds"],
-               "decoding": decoding,
-               "official_metric": False, "environment": environment(), "data": info,
-               "notes": ["BTC chưa công bố dung sai và evaluator chính thức.",
-                         "Exact: chuỗi đáp án sau NFC/khoảng trắng + đơn vị alias ASCII.",
-                         "Tolerant: biểu thức số an toàn; không đổi thang đơn vị, không suy luận tương đương biểu thức có biến.",
-                         "Không chấm chất lượng explanation; yêu cầu explanation không rỗng.",
-                         "Mẫu quá thời gian bị tính sai; deadline chỉ dừng ở ranh giới token."]}
-    if (manifest.get("split") or {}).get("validation_source") == "dev":
-        summary["notes"].append("Dev đã dùng chọn checkpoint; điểm này là validation, không phải test độc lập.")
-    save_json(result_dir / "metrics.json", summary)
-    print(f"P1 ước lượng: {counts['p1_estimate']}/{counts['total']} | "
-          f"content đúng={counts['content_tolerant']} | JSON hợp lệ={counts['valid_json']} | "
-          f"quá thời gian={counts['over_time']}. Kết quả: {result_dir}", flush=True)
-    return summary
+    dev_summary = evaluate_split(model, tokenizer, splits["dev"], "dev", result_dir, cfg, decoding,
+                                 train_questions, info)
+    test_rows, test_info = load_test_data(cfg, test_file)
+    if test_rows is None:
+        print("Không tìm thấy test_dataset.csv; bỏ qua phase evaluate test. Dùng --test-file để chỉ rõ file.",
+              flush=True)
+        return dev_summary
+    test_summary = evaluate_split(model, tokenizer, test_rows, "test", result_dir / "test", cfg, decoding,
+                                  train_questions, test_info)
+    dev_summary["test_summary"] = {"metrics": str(result_dir / "test" / "metrics.json"),
+                                   "evaluated": test_summary["evaluated"],
+                                   "accuracy": test_summary["accuracy"]}
+    save_json(result_dir / "evaluation_summary.json", {"dev": dev_summary, "test": test_summary})
+    return dev_summary
 
 
 def main():
     """Entry point; mặc định dùng toàn bộ cấu hình đã lưu của lần train."""
-    parser = argparse.ArgumentParser(description="Evaluate dev ViPRA")
+    parser = argparse.ArgumentParser(description="Evaluate dev rồi test ViPRA")
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--result-dir")
     parser.add_argument("--data-root")
     parser.add_argument("--train-file")
     parser.add_argument("--dev-file")
+    parser.add_argument("--test-file", help="CSV test có nhãn; sau dev sẽ được chấm ở phase test")
     parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu/câu; mặc định run hoặc 5, dùng 1 để so greedy")
     parser.add_argument("--sampling-temperature", type=float)
     parser.add_argument("--sampling-top-p", type=float)
     args = parser.parse_args()
     evaluate(args.run_dir, args.result_dir, args.data_root, args.train_file, args.dev_file,
-             args.self_consistency_samples, args.sampling_temperature, args.sampling_top_p)
+             args.self_consistency_samples, args.sampling_temperature, args.sampling_top_p,
+             args.test_file)
 
 
 if __name__ == "__main__":

@@ -79,11 +79,14 @@ Lệnh evaluate riêng dùng model chia lớp trong một tiến trình, không 
 3. Chọn epoch theo **content_tolerant accuracy** (đáp án + đơn vị). Nếu hòa: content_exact cao hơn, dev loss thấp hơn, epoch sớm hơn. Không dùng timeout để xếp hạng. Dung sai mặc định `rtol=0.05, atol=0` (5% theo đáp án chuẩn).
 4. Xuất đúng checkpoint thắng vào **`RUN_DIR/adapter`**, kèm tokenizer và `RUN_DIR/run.json`. Nếu epoch 3 thắng thì adapter xuất ra lấy trọng số epoch 3, dù đã train đủ 5 epoch. **Không retrain**, không nạp lại backbone sau bước chọn. `selection.json` lưu điểm cả 5 epoch và checkpoint thắng, `experiment.json` chuyển sang `complete`.
 
-Launcher tự tạo 2 worker FSDP song song, một worker/GPU. Mỗi cấu hình dùng thư mục output mới. `baseline.train` CLI mặc định gọi cùng workflow. Notebook hiển thị điểm dev đã lưu của best epoch; không tự sinh lại dev thêm lần nữa. Có thể gọi riêng lệnh dưới để đo lại thời gian từng câu; đây vẫn là điểm trên tập validation đã dùng chọn model, không phải test độc lập:
+Launcher tự tạo 2 worker FSDP song song, một worker/GPU. Mỗi cấu hình dùng thư mục output mới. `baseline.train` CLI mặc định gọi cùng workflow. Notebook hiển thị điểm dev đã lưu của best epoch; không tự sinh lại dev thêm lần nữa. Lệnh evaluate chấm dev trước, sau đó chấm `test_dataset.csv` nếu truyền `--test-file` hoặc tìm thấy đúng một file test trong `data_root`. Dev vẫn là tập đã dùng chọn model; test được ghi riêng và không ảnh hưởng checkpoint:
 
 ```python
-!python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen3_4b_instruct_2507_train_dev01
+!python -m baseline.evaluate --run-dir /kaggle/working/vipra_qwen3_4b_instruct_2507_train_dev01 \
+    --test-file /path/to/test_dataset.csv
 ```
+
+Log in `Dev accuracy: đúng/tổng = ...` và `Test accuracy: đúng/tổng = ...`. Kết quả dev nằm ở `evaluation/metrics.json`, test nằm ở `evaluation/test/metrics.json`; `evaluation/evaluation_summary.json` chứa cả hai summary.
 
 ## Thực nghiệm nhiều learning rate và giới hạn sinh
 
@@ -189,8 +192,11 @@ search/                          # Run FSDP: run.json, train_log.json, adapter/ 
   best_checkpoint.json           # Checkpoint của epoch tốt nhất
 adapter/                         # Adapter BEST epoch + tokenizer, dùng trực tiếp
 run.json                         # Manifest adapter best, có adapter_epoch
-evaluation/metrics.json          # Chỉ tạo nếu gọi evaluate riêng trên dev
-evaluation/predictions.jsonl
+evaluation/metrics.json          # Metrics + accuracy của dev
+evaluation/predictions.jsonl     # Prediction của dev
+evaluation/test/metrics.json     # Metrics + accuracy của test
+evaluation/test/predictions.jsonl
+evaluation/evaluation_summary.json
 ```
 
 ## Code và kiểm tra
@@ -205,7 +211,7 @@ evaluation/predictions.jsonl
 | `baseline/parallel.py` | Launcher torchrun, FSDP2, chia batch, overflow/clipping và lưu adapter |
 | `baseline/parallel_check.py` | Preflight backend thật: Qwen nhỏ, gradient và optimizer đối chiếu reference |
 | `baseline/validation.py` | Chấm validation, sinh batch 4, xếp hạng checkpoint |
-| `baseline/evaluate.py` | Greedy trên dev, ghi predictions và metrics |
+| `baseline/evaluate.py` | Chấm dev rồi test có nhãn, ghi predictions, metrics và accuracy |
 | `baseline/metrics.py` | Parse JSON và P1 tạm thời |
 | `baseline/check.py` | Kiểm tra dữ liệu/template/độ dài trước train |
 | `baseline/runtime.py` | Seed, cấu hình và manifest |
