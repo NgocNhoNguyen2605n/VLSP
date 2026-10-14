@@ -29,6 +29,7 @@ def read_config(args):
     """Nạp cấu hình và kiểm tra các giới hạn quan trọng."""
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
     cfg.setdefault("self_consistency_samples", 1)
+    cfg.setdefault("beam_width", 3)
     cfg.setdefault("sampling_temperature", 0.7)
     cfg.setdefault("sampling_top_p", 0.8)
     decoding_settings(cfg)
@@ -102,7 +103,8 @@ def print_training_config(cfg, target_modules, world_size=1):
         lines.extend([
             "Dữ liệu: toàn bộ train_dataset.csv | validation=dev_dataset.csv | "
             f"checkpoint_selection={cfg.get('checkpoint_selection', 'answer_accuracy')} | không retrain",
-            f"Validation: samples={decoding_settings(cfg)['samples']} | generation batch={cfg.get('validation_batch_size', 4)} | max_new_tokens={cfg['max_new_tokens']} | "
+            f"Validation: decoding={decoding_settings(cfg)['mode']} | beam_width={decoding_settings(cfg)['beam_width']} | "
+            f"samples={decoding_settings(cfg)['samples']} | generation batch={cfg.get('validation_batch_size', 4)} | max_new_tokens={cfg['max_new_tokens']} | "
             f"timeout_seconds={cfg['timeout_seconds']} | rtol={cfg['rtol']:g} | atol={cfg['atol']:g}",
         ])
         if cfg.get("checkpoint_selection") == "fixed_epoch":

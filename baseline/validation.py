@@ -28,7 +28,7 @@ def checkpoint_rank(result):
 
 def validate_epoch(learner, loader, rows, tokenizer, cfg, epoch, result_dir, primary=True,
                    generation_context=None):
-    """Loss có trọng số token; chấm đáp án đã bỏ phiếu khi bật generation."""
+    """Loss có trọng số token; chấm đáp án sau decoding khi bật generation."""
     batch_size = cfg.get("validation_batch_size", 4)
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("validation_batch_size phải là số nguyên dương.")

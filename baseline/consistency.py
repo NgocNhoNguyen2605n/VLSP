@@ -8,20 +8,28 @@ from .metrics import canonical_text, numeric_value, parse_prediction, unit_ascii
 
 
 def decoding_settings(config):
-    """Một mẫu là greedy; nhiều mẫu dùng cùng tham số ở Transformers và vLLM."""
+    """Chuẩn hóa cấu hình decoding dùng chung cho Transformers và vLLM."""
     get = config.get if isinstance(config, Mapping) else lambda key, default: getattr(config, key, default)
     samples = get("self_consistency_samples", 1)
+    beam_width = get("beam_width", 3)
     temperature = get("sampling_temperature", 0.7)
     top_p = get("sampling_top_p", 0.8)
     if type(samples) is not int or samples <= 0:
         raise ValueError("self_consistency_samples phải là số nguyên dương.")
+    if type(beam_width) is not int or beam_width <= 0:
+        raise ValueError("beam_width phải là số nguyên dương.")
+    if beam_width > 1 and samples > 1:
+        raise ValueError("Không bật đồng thời beam search và self-consistency sampling.")
     for name, value in (("sampling_temperature", temperature), ("sampling_top_p", top_p)):
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} phải là số dương hữu hạn.")
     if top_p > 1:
         raise ValueError("sampling_top_p phải nằm trong (0, 1].")
-    return {"samples": samples, "temperature": float(temperature) if samples > 1 else 0.0,
-            "top_p": float(top_p) if samples > 1 else 1.0}
+    beam_search = beam_width > 1
+    return {"samples": samples, "beam_width": beam_width, "beam_search": beam_search,
+            "mode": "beam_search" if beam_search else "sampling" if samples > 1 else "greedy",
+            "temperature": 0.0 if beam_search else float(temperature) if samples > 1 else 0.0,
+            "top_p": 1.0 if beam_search else float(top_p) if samples > 1 else 1.0}
 
 
 def prediction_key(prediction):

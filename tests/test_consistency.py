@@ -62,13 +62,21 @@ class ConsistencyTests(unittest.TestCase):
         self.assertEqual(info["vote_count"], 2)
         self.assertEqual(len(info["groups"]), 2)
 
-    def test_sampling_parameters_are_validated_and_one_sample_is_greedy(self):
-        self.assertEqual(decoding_settings({"self_consistency_samples": 5}),
-                         {"samples": 5, "temperature": 0.7, "top_p": 0.8})
-        self.assertEqual(decoding_settings({"self_consistency_samples": 1}),
-                         {"samples": 1, "temperature": 0.0, "top_p": 1.0})
+    def test_decoding_modes_are_validated(self):
+        self.assertEqual(decoding_settings({"beam_width": 3, "self_consistency_samples": 1}),
+                         {"samples": 1, "beam_width": 3, "beam_search": True, "mode": "beam_search",
+                          "temperature": 0.0, "top_p": 1.0})
+        self.assertEqual(decoding_settings({"beam_width": 1, "self_consistency_samples": 1}),
+                         {"samples": 1, "beam_width": 1, "beam_search": False, "mode": "greedy",
+                          "temperature": 0.0, "top_p": 1.0})
+        self.assertEqual(decoding_settings({"beam_width": 1, "self_consistency_samples": 5}),
+                         {"samples": 5, "beam_width": 1, "beam_search": False, "mode": "sampling",
+                          "temperature": 0.7, "top_p": 0.8})
         for invalid in ({"self_consistency_samples": True}, {"self_consistency_samples": 0},
+                        {"beam_width": True}, {"beam_width": 0},
                         {"sampling_temperature": 0}, {"sampling_temperature": float("nan")},
                         {"sampling_top_p": 1.1}):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 decoding_settings(invalid)
+        with self.assertRaises(ValueError):
+            decoding_settings({"beam_width": 3, "self_consistency_samples": 5})

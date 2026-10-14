@@ -81,6 +81,7 @@ def prepare(output_dir, run_dir=None, base_only=False, team_name="Viper"):
                    model_name=f"{team_name}-{model_id.split('/')[-1].removesuffix('-Instruct')}-LoRA",
                    adapter_path="adapter", max_new_tokens=training_cfg["max_new_tokens"], seed=training_cfg["seed"],
                    self_consistency_samples=1,
+                   beam_width=training_cfg.get("beam_width", 3),
                    sampling_temperature=training_cfg.get("sampling_temperature", 0.7),
                    sampling_top_p=training_cfg.get("sampling_top_p", 0.8))
         provenance.update(base_model=model_id, revision=training_cfg["revision"], base_parameters=base_parameters,

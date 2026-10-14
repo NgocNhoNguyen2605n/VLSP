@@ -1,4 +1,4 @@
-"""vLLM nhận n=5 trong một request; API giữ deadline chung và log kết quả bỏ phiếu."""
+"""vLLM nhận beam width trong một request; API giữ deadline chung và log kết quả."""
 
 import asyncio
 import json
@@ -31,7 +31,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"choices": list(reversed(outputs)),
                                              "usage": {"completion_tokens": 100}})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
-            backend = VLLMBackend(ServingConfig(), client)
+            backend = VLLMBackend(ServingConfig(beam_width=1, self_consistency_samples=5), client)
             result, info = await backend.predict(Query(query_id="q", query="Tính lực."))
         self.assertEqual(len(calls), 1)
         self.assertEqual((calls[0]["n"], calls[0]["temperature"], calls[0]["top_p"]), (5, 0.7, 0.8))
@@ -48,7 +48,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(
                 lambda request: httpx.Response(200, json={"choices": outputs})), base_url="http://test") as client:
             with self.assertRaises(ModelOutputError) as raised:
-                await VLLMBackend(ServingConfig(), client).predict(Query(query_id="q", query="Câu hỏi"))
+                await VLLMBackend(ServingConfig(beam_width=1, self_consistency_samples=5), client).predict(
+                    Query(query_id="q", query="Câu hỏi"))
         self.assertEqual(raised.exception.details["self_consistency"]["valid_samples"], 0)
         self.assertEqual(len(raised.exception.details["self_consistency"]["candidates"]), 5)
 
@@ -57,7 +58,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(
                     lambda request: httpx.Response(200, json={"choices": outputs})), base_url="http://test") as client:
                 with self.subTest(count=len(outputs)), self.assertRaises(ModelOutputError):
-                    await VLLMBackend(ServingConfig(), client).predict(Query(query_id="q", query="Câu hỏi"))
+                    await VLLMBackend(ServingConfig(beam_width=1, self_consistency_samples=5), client).predict(Query(query_id="q", query="Câu hỏi"))
 
     async def test_one_sample_keeps_greedy_request(self):
         sent = []
@@ -65,10 +66,23 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             sent.append(json.loads(request.content))
             return httpx.Response(200, json={"choices": choices(["6"])})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
-            result, _ = await VLLMBackend(ServingConfig(self_consistency_samples=1), client).predict(
+            result, _ = await VLLMBackend(ServingConfig(beam_width=1, self_consistency_samples=1), client).predict(
                 Query(query_id="q", query="Câu hỏi"))
         self.assertEqual((sent[0]["n"], sent[0]["temperature"], sent[0]["top_p"]), (1, 0.0, 1.0))
         self.assertEqual(result["answer"], "6")
+
+    async def test_beam_search_sends_width_and_selects_first_ranked_choice(self):
+        sent = []
+        outputs = choices(["1", "2", "3"])
+        def handle(request):
+            sent.append(json.loads(request.content))
+            return httpx.Response(200, json={"choices": list(reversed(outputs))})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+            result, info = await VLLMBackend(ServingConfig(beam_width=3), client).predict(
+                Query(query_id="q", query="Câu hỏi"))
+        self.assertEqual((sent[0]["use_beam_search"], sent[0]["n"], sent[0]["temperature"]), (True, 3, 0.0))
+        self.assertEqual(result["answer"], "1")
+        self.assertEqual(info["beam_search"]["selected_index"], 0)
 
 
 class APITests(unittest.TestCase):
@@ -81,10 +95,10 @@ class APITests(unittest.TestCase):
                 self.calls += 1
                 await asyncio.sleep(0.2)
         with tempfile.TemporaryDirectory() as directory:
-            cfg = ServingConfig(log_dir=directory, request_deadline_seconds=0.02)
+            cfg = ServingConfig(log_dir=directory, request_deadline_seconds=0.02, beam_width=3)
             engine = SlowBackend()
             with TestClient(create_app(cfg, backend=engine)) as client:
-                self.assertEqual(client.get("/healthz").json()["decoding"]["samples"], 5)
+                self.assertEqual(client.get("/healthz").json()["decoding"]["beam_width"], 3)
                 response = client.post("/predict", json={"query_id": "q", "query": "Câu hỏi"})
             self.assertEqual(response.status_code, 504)
             self.assertEqual(engine.calls, 1)
@@ -98,7 +112,7 @@ class APITests(unittest.TestCase):
             async def predict(self, query):
                 raise ModelOutputError("no valid samples", {"self_consistency": {"valid_samples": 0}})
         with tempfile.TemporaryDirectory() as directory:
-            with TestClient(create_app(ServingConfig(log_dir=directory), backend=InvalidBackend())) as client:
+            with TestClient(create_app(ServingConfig(log_dir=directory, beam_width=3), backend=InvalidBackend())) as client:
                 response = client.post("/predict", json={"query_id": "q", "query": "Câu hỏi"})
             self.assertEqual(response.status_code, 502)
             event = json.loads((Path(directory) / "requests.jsonl").read_text())

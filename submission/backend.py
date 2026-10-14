@@ -47,20 +47,36 @@ class VLLMBackend:
     async def predict(self, query):
         cfg = self.config
         decoding = decoding_settings(cfg)
-        response = await self.client.post("/v1/chat/completions", json={
-            "model": cfg.model_name, "messages": prompt_messages(query.query),
-            "max_tokens": cfg.max_new_tokens, "temperature": decoding["temperature"], "top_p": decoding["top_p"],
-            "top_k": -1, "repetition_penalty": 1, "seed": cfg.seed,
-            "n": decoding["samples"], "stream": False})
+        payload = {"model": cfg.model_name, "messages": prompt_messages(query.query),
+                   "max_tokens": cfg.max_new_tokens, "temperature": decoding["temperature"],
+                   "repetition_penalty": 1, "seed": cfg.seed, "stream": False}
+        if decoding["beam_search"]:
+            # vLLM exposes beam width through n when use_beam_search=true.
+            # The returned choices are ranked; the first one is the winner.
+            payload.update(use_beam_search=True, n=decoding["beam_width"])
+        else:
+            payload.update(top_p=decoding["top_p"], top_k=-1, n=decoding["samples"])
+        response = await self.client.post("/v1/chat/completions", json=payload)
         response.raise_for_status()
         body = response.json()
         choices = body["choices"]
         details = {"usage": body.get("usage", {}), "decoding": decoding}
-        if not isinstance(choices, list) or len(choices) != decoding["samples"]:
+        expected_choices = decoding["beam_width"] if decoding["beam_search"] else decoding["samples"]
+        if not isinstance(choices, list) or len(choices) != expected_choices:
             raise ModelOutputError("vLLM không trả đủ số mẫu yêu cầu.", details)
         if any(not isinstance(choice, dict) or not isinstance(choice.get("message"), dict) for choice in choices):
             raise ModelOutputError("vLLM trả choices sai schema.", details)
-        if decoding["samples"] > 1:
+        if decoding["beam_search"]:
+            if len(choices) != decoding["beam_width"]:
+                raise ModelOutputError("vLLM không trả đủ beam cho yêu cầu.", details)
+            indices = [choice.get("index") for choice in choices]
+            if sorted(index for index in indices if type(index) is int) != list(range(len(choices))):
+                raise ModelOutputError("vLLM trả index beam trùng hoặc không hợp lệ.", details)
+            choices = sorted(choices, key=lambda choice: choice["index"])
+            details["beam_search"] = {"beam_width": decoding["beam_width"],
+                                       "returned": len(choices), "selected_index": 0}
+            choice = choices[0]
+        elif decoding["samples"] > 1:
             # vLLM có thể trả choices không theo thứ tự; index quyết định cách xử lý hòa.
             indices = [choice.get("index") for choice in choices]
             if sorted(index for index in indices if type(index) is int) != list(range(len(choices))):

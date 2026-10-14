@@ -27,7 +27,7 @@ class Tokenizer:
 
 
 class GenerationTests(unittest.TestCase):
-    cfg = {"gpu_count": 2, "max_new_tokens": 4, "timeout_seconds": 60}
+    cfg = {"gpu_count": 2, "max_new_tokens": 4, "timeout_seconds": 60, "beam_width": 1}
 
     def test_five_samples_are_grouped_per_question_with_one_shared_deadline(self):
         from tests.test_consistency import candidate
@@ -124,6 +124,21 @@ class GenerationTests(unittest.TestCase):
         with patch("baseline.evaluate.generate_batch", return_value=[outputs[0]]) as batch:
             self.assertEqual(generate_once(model, Tokenizer(), "1", self.cfg), outputs[0])
             batch.assert_called_once_with(model, unittest.mock.ANY, ["1"], self.cfg)
+
+    def test_beam_search_uses_one_ranked_result_per_question(self):
+        model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=64),
+                                get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1)))
+        def generate(**kwargs):
+            config = kwargs["generation_config"]
+            self.assertFalse(config.do_sample)
+            self.assertEqual(config.num_beams, 3)
+            self.assertEqual(config.num_return_sequences, 1)
+            return torch.cat((kwargs["input_ids"], torch.tensor([[9, 2]])), dim=1)
+        model.generate = generate
+        cfg = {**self.cfg, "beam_width": 3}
+        with patch("baseline.evaluate.synchronize"), patch("baseline.evaluate.time.perf_counter", side_effect=[10, 13]):
+            outputs = generate_batch(model, Tokenizer(), ["1"], cfg)
+        self.assertEqual(outputs, [("[9]", 3, 2, True)])
 
     def test_real_qwen_batch_greedy_matches_single_queries(self):
         from transformers import Qwen2Config, Qwen2ForCausalLM

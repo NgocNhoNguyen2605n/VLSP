@@ -23,7 +23,8 @@ def vllm_command(cfg, backend="cuda", executable="vllm"):
                "--served-model-name", cfg.base_model, "--host", "127.0.0.1", "--port", "8000",
                "--dtype", "float16", "--tensor-parallel-size", "1",
                "--max-model-len", str(cfg.max_model_len),
-               "--max-num-seqs", str(decoding_settings(cfg)["samples"]),
+               "--max-num-seqs", str(1 if decoding_settings(cfg)["beam_search"]
+                                     else decoding_settings(cfg)["samples"]),
                "--gpu-memory-utilization", str(cfg.gpu_memory_utilization),
                "--generation-config", "vllm", "--seed", str(cfg.seed)]
     if backend == "metal":

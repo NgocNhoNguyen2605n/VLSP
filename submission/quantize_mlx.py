@@ -1,4 +1,4 @@
-"""Chuyển backbone đúng revision sang MLX 4-bit; giữ nguyên adapter PEFT."""
+"""Chuyển backbone đúng revision sang MLX n-bit; giữ nguyên adapter PEFT."""
 import argparse
 import hashlib
 import json
@@ -16,10 +16,12 @@ def fingerprint(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tạo backbone MLX 4-bit từ revision của checkpoint")
+    parser = argparse.ArgumentParser(description="Tạo backbone MLX n-bit từ revision của checkpoint")
     parser.add_argument("--deployment", required=True)
     parser.add_argument("--snapshot", required=True, help="Hugging Face snapshot đã tải đúng revision")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--bits", type=int, choices=(4, 8), default=4,
+                        help="Số bit lượng tử hóa; mặc định 4 để giữ tương thích")
     args = parser.parse_args()
     folder = Path(args.deployment).resolve()
     provenance = json.loads((folder / "provenance.json").read_text())
@@ -40,7 +42,7 @@ def main():
     from mlx_lm.convert import convert
     # Chuyển đổi trên CPU để không nạp toàn bộ backbone FP16 vào GPU 16 GiB.
     mx.set_default_device(mx.cpu)
-    convert(str(snapshot), mlx_path=str(output), quantize=True, q_bits=4,
+    convert(str(snapshot), mlx_path=str(output), quantize=True, q_bits=args.bits,
             q_group_size=64, q_mode="affine", dtype="float16", trust_remote_code=False)
     tokenizer_config = json.loads((output / "tokenizer_config.json").read_text())
     template = tokenizer_config.get("chat_template")
@@ -49,12 +51,12 @@ def main():
     if not isinstance(template, str) or hashlib.sha256(template.encode()).hexdigest() != provenance["template_sha256"]:
         raise ValueError("Chat template sau chuyển đổi không khớp run training.")
     manifest = {"status": "complete", "base_model": model, "revision": revision,
-                "precision": "mlx-4bit", "bits": 4, "group_size": 64, "mode": "affine",
+                "precision": f"mlx-{args.bits}bit", "bits": args.bits, "group_size": 64, "mode": "affine",
                 "non_quantized_dtype": "float16", "template_sha256": provenance["template_sha256"],
                 "source_weights": {p.name: fingerprint(p) for p in sorted(snapshot.glob("*.safetensors"))},
                 "converted_weights": {p.name: fingerprint(p) for p in sorted(output.glob("*.safetensors"))}}
     (output / "conversion.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"MLX 4-bit đã chuyển đổi và kiểm tra provenance: {output}", flush=True)
+    print(f"MLX {args.bits}-bit đã chuyển đổi và kiểm tra provenance: {output}", flush=True)
 
 
 if __name__ == "__main__":

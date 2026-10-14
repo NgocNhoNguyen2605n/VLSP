@@ -83,10 +83,12 @@ def create_report(train_file, dev_file, output, deployment=None, font=None, bold
     precision = ("The backbone is converted from the pinned revision to MLX affine 4-bit (group size 64); LoRA is applied separately through vLLM Metal on Apple Silicon. "
                  if provenance and provenance.get("inference_precision") == "mlx-4bit" else "")
     serving = json.loads((Path(deployment) / "serving.json").read_text()) if deployment else cfg
-    settings = decoding_settings({"self_consistency_samples": 5, **serving})
-    decoding = (f"self-consistency samples {settings['samples']} explanations in one call "
-                f"(temperature={settings['temperature']:g}, top_p={settings['top_p']:g}) and votes on normalized answer/unit tuples; ties use the first candidate"
-                if settings["samples"] > 1 else "greedy decoding generates one explanation and answer")
+    settings = decoding_settings({"beam_width": 3, "self_consistency_samples": 1, **serving})
+    decoding = (f"beam search with width {settings['beam_width']} selects the highest-scoring explanation"
+                if settings["beam_search"] else
+                f"greedy decoding generates one explanation and answer"
+                if settings["samples"] == 1 else
+                f"self-consistency samples {settings['samples']} explanations and votes on normalized answer/unit tuples")
     add(f"Inference runs one self-hosted vLLM engine with the selected LoRA. {precision}The official chat template is retained; {decoding}, at most {serving['max_new_tokens']} new tokens per sample. The API attaches query_id, normalizes units to ASCII, and returns one JSON result. No answer labels, retrieval, external solver or third-party inference API are used at prediction time.")
     add("3. Models and capacity", "head")
     # Tổng (in + out) của 7 projection, gồm GQA và head_dim riêng của Qwen3.

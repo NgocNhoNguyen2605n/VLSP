@@ -9,7 +9,7 @@ import time  # Đo thời gian mỗi câu theo deadline generation trong cấu h
 from pathlib import Path  # Đọc manifest và lưu JSONL.
 
 import torch  # Inference không gradient, dùng FP16 trên hai GPU.
-from transformers import GenerationConfig, StoppingCriteria, StoppingCriteriaList  # Greedy và deadline.
+from transformers import GenerationConfig, StoppingCriteria, StoppingCriteriaList  # Beam search và deadline.
 
 from .data import find_csv, load_csv, load_data, prompt_ids  # Prompt chỉ có câu hỏi.
 from .consistency import decoding_settings, select_consistent
@@ -53,6 +53,8 @@ def generate_batch(model, tokenizer, questions, cfg, diagnostics=None):
     start = time.perf_counter()
     decoding = decoding_settings(cfg)
     samples = decoding["samples"]
+    beam_width = decoding["beam_width"]
+    return_sequences = samples if not decoding["beam_search"] else 1
     prompts = [prompt_ids(tokenizer, question) for question in questions]
     width = max(map(len, prompts))
     if width + cfg["max_new_tokens"] > model.config.max_position_embeddings:
@@ -64,11 +66,17 @@ def generate_batch(model, tokenizer, questions, cfg, diagnostics=None):
         tensor[index, -len(ids):] = torch.tensor(ids, dtype=torch.long, device=device)
         mask[index, -len(ids):] = 1
     generation = GenerationConfig(
-        do_sample=samples > 1, num_beams=1, num_return_sequences=samples,
+        do_sample=samples > 1 and not decoding["beam_search"],
+        num_beams=beam_width if decoding["beam_search"] else 1,
+        num_return_sequences=return_sequences,
         max_new_tokens=cfg["max_new_tokens"],
         eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
-        use_cache=True, temperature=decoding["temperature"] if samples > 1 else None,
-        top_p=decoding["top_p"] if samples > 1 else None, top_k=0 if samples > 1 else None)
+        use_cache=True,
+        temperature=decoding["temperature"] if samples > 1 and not decoding["beam_search"] else None,
+        top_p=decoding["top_p"] if samples > 1 and not decoding["beam_search"] else None,
+        top_k=0 if samples > 1 and not decoding["beam_search"] else None,
+        length_penalty=1.0 if decoding["beam_search"] else None,
+        early_stopping=True if decoding["beam_search"] else None)
     with torch.inference_mode(), torch.autocast(tensor.device.type, dtype=torch.float16):
         output = model.generate(
             input_ids=tensor, attention_mask=mask,
@@ -76,8 +84,8 @@ def generate_batch(model, tokenizer, questions, cfg, diagnostics=None):
             synced_gpus=torch.distributed.is_initialized(),
             stopping_criteria=StoppingCriteriaList([Deadline(start + cfg["timeout_seconds"])]))
     synchronize(cfg["gpu_count"])
-    if output.shape[0] != len(questions) * samples:
-        raise ValueError("Generation không trả đủ số mẫu cho mỗi câu hỏi.")
+    if output.shape[0] != len(questions) * return_sequences:
+        raise ValueError("Generation không trả đủ số kết quả cho mỗi câu hỏi.")
     candidates = []
     for tokens in output[:, width:].tolist():
         # Câu kết thúc sớm được pad trong khi các câu còn lại tiếp tục sinh.
@@ -87,11 +95,12 @@ def generate_batch(model, tokenizer, questions, cfg, diagnostics=None):
         text = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         candidates.append({"raw_output": text, "generated_tokens": len(tokens), "finished": finished})
     results = []
-    for start_index in range(0, len(candidates), samples):
-        group = candidates[start_index:start_index + samples]
+    for start_index in range(0, len(candidates), return_sequences):
+        group = candidates[start_index:start_index + return_sequences]
         selected, details = select_consistent(group)
-        if samples == 1:
-            # Giữ hành vi greedy cũ, kể cả output bị cắt, để so sánh baseline.
+        if decoding["beam_search"] or samples == 1:
+            # Beam search đã xếp hạng các candidate; lấy beam đầu tiên. Với một
+            # mẫu, giữ output kể cả khi deadline cắt giữa chừng để evaluator ghi nhận.
             selected = 0
         winner = group[selected] if selected is not None else {
             "raw_output": "", "finished": all(candidate["finished"] for candidate in group)}
@@ -196,7 +205,7 @@ def evaluate_split(model, tokenizer, rows, split_name, result_dir, cfg, decoding
 
 def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file=None,
              self_consistency_samples=None, sampling_temperature=None, sampling_top_p=None,
-             test_file=None):
+             test_file=None, beam_width=None):
     """Chấm dev trước, sau đó chấm test có nhãn nếu có đường dẫn hoặc file tự tìm thấy."""
     run_dir = Path(run_dir)
     if (run_dir / "experiment.json").is_file():
@@ -215,13 +224,18 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
     if manifest.get("training_status", "complete") != "complete":
         raise RuntimeError("Train chưa hoàn tất; không chấm adapter của lần chạy đang dở.")
     cfg = manifest["config"].copy()
+    if beam_width is not None:
+        cfg["beam_width"] = beam_width
+    else:
+        cfg.setdefault("beam_width", 3)
     for key, value, default in (("self_consistency_samples", self_consistency_samples, 1),
                                 ("sampling_temperature", sampling_temperature, 0.7),
                                 ("sampling_top_p", sampling_top_p, 0.8)):
         if value is not None:
             cfg[key] = value
         elif key == "self_consistency_samples":
-            # Evaluation defaults to greedy even when an older run manifest recorded SC5.
+            # Evaluation defaults to the current deterministic beam configuration
+            # even when an older run manifest recorded SC5.
             cfg[key] = default
         else:
             cfg.setdefault(key, default)
@@ -271,13 +285,14 @@ def main():
     parser.add_argument("--train-file")
     parser.add_argument("--dev-file")
     parser.add_argument("--test-file", help="CSV test có nhãn; sau dev sẽ được chấm ở phase test")
-    parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu/câu; mặc định run hoặc 1 (greedy)")
+    parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu sampling; chỉ dùng khi beam-width=1")
     parser.add_argument("--sampling-temperature", type=float)
     parser.add_argument("--sampling-top-p", type=float)
+    parser.add_argument("--beam-width", type=int, help="Số beam; mặc định 3")
     args = parser.parse_args()
     evaluate(args.run_dir, args.result_dir, args.data_root, args.train_file, args.dev_file,
              args.self_consistency_samples, args.sampling_temperature, args.sampling_top_p,
-             args.test_file)
+             args.test_file, args.beam_width)
 
 
 if __name__ == "__main__":

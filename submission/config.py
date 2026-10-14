@@ -32,6 +32,7 @@ class ServingConfig:
     request_deadline_seconds: float = 55
     seed: int = 42
     self_consistency_samples: int = 1
+    beam_width: int = 3
     sampling_temperature: float = 0.7
     sampling_top_p: float = 0.8
     max_model_len: int = 4096
@@ -62,10 +63,10 @@ class ServingConfig:
             raise ValueError("LoRA phải có model_name riêng để tránh gọi nhầm backbone.")
         if self.base_only and (self.model_name != self.base_model or self.adapter_path):
             raise ValueError("base_only phải dùng tên backbone và không có adapter.")
-        if self.backbone_precision not in ("float16", "mlx-4bit"):
-            raise ValueError("backbone_precision cần float16 hoặc mlx-4bit.")
-        if self.backbone_precision == "mlx-4bit" and not self.backbone_path:
-            raise ValueError("mlx-4bit cần backbone_path đã chuyển đổi.")
+        if self.backbone_precision not in ("float16", "mlx-4bit", "mlx-8bit"):
+            raise ValueError("backbone_precision cần float16, mlx-4bit hoặc mlx-8bit.")
+        if self.backbone_precision in ("mlx-4bit", "mlx-8bit") and not self.backbone_path:
+            raise ValueError(f"{self.backbone_precision} cần backbone_path đã chuyển đổi.")
 
     @classmethod
     def load(cls, path=None):
@@ -97,5 +98,8 @@ class ServingConfig:
             if conversion.get("base_model") != self.base_model or conversion.get("revision") != self.revision:
                 raise ValueError("Backbone chuyển đổi khác model/revision của checkpoint.")
             config = json.loads((folder / "config.json").read_text())
-            if self.backbone_precision == "mlx-4bit" and config.get("quantization", {}).get("bits") != 4:
-                raise ValueError("Backbone không có metadata MLX 4-bit.")
+            if self.backbone_precision in ("mlx-4bit", "mlx-8bit"):
+                expected_bits = int(self.backbone_precision.split("-")[1].removesuffix("bit"))
+                actual_bits = config.get("quantization", {}).get("bits")
+                if actual_bits != expected_bits:
+                    raise ValueError(f"Backbone cần metadata MLX {expected_bits}-bit, nhận {actual_bits}.")
