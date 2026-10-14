@@ -83,7 +83,7 @@ def create_report(train_file, dev_file, output, deployment=None, font=None, bold
     precision = ("The backbone is converted from the pinned revision to MLX affine 4-bit (group size 64); LoRA is applied separately through vLLM Metal on Apple Silicon. "
                  if provenance and provenance.get("inference_precision") == "mlx-4bit" else "")
     serving = json.loads((Path(deployment) / "serving.json").read_text()) if deployment else cfg
-    settings = decoding_settings({"beam_width": 3, "self_consistency_samples": 1, **serving})
+    settings = decoding_settings({"beam_width": 1, "self_consistency_samples": 1, **serving})
     decoding = (f"beam search with width {settings['beam_width']} selects the highest-scoring explanation"
                 if settings["beam_search"] else
                 f"greedy decoding generates one explanation and answer"

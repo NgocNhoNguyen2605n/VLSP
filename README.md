@@ -27,7 +27,7 @@ Baseline: `Qwen/Qwen3-4B-Instruct-2507`, backbone FP16, **LoRA thuần**, không
 
 - Train **5 epoch với seed 42**, xuất checkpoint epoch 5 (`fixed_epoch`). Batch 4/GPU, tích lũy gradient 2/GPU trên 2 GPU, LoRA rank 16/alpha 32/dropout 0, learning rate `1e-4`.
 - Kiến trúc Qwen3 có 36 lớp, `head_dim=128`, hidden size 2560 và embedding/head dùng chung (`tie_word_embeddings=true`). Backbone có **4.022.468.096 tham số độc lập**, LoRA thêm **33.030.144**, tổng **4.055.498.240 < 8B**; backbone FP16 khoảng **7,49 GiB**. FSDP giữ embedding/head dùng chung frozen trên mỗi rank và shard decoder; cần đo activation/peak VRAM thực tế trên T4 x2.
-- Dùng chat template chính thức ở chế độ instruct, không có generation prefix `<think>`. SFT đưa `cot` một lần vào trường `explanation` của JSON cuối; mask prompt và học phần assistant bằng teacher forcing. API trả JSON, `reasoning=null`; inference mặc định beam search với 3 beam, sinh một đáp án mỗi câu.
+- Dùng chat template chính thức ở chế độ instruct, không có generation prefix `<think>`. SFT đưa `cot` một lần vào trường `explanation` của JSON cuối; mask prompt và học phần assistant bằng teacher forcing. API trả JSON, `reasoning=null`; inference mặc định greedy, sinh một đáp án mỗi câu.
 - `max_length=1700` chứa system prompt, câu hỏi và JSON lời giải trực tiếp; `max_new_tokens=1500` giới hạn output khi inference. Mẫu dev dài nhất hiện đo được là 1671 token; mẫu vượt giới hạn sẽ dừng báo lỗi, không bị cắt ngầm.
 
 Adapter Qwen2.5 cũ không tương thích Qwen3. Train lại trong output mới `/kaggle/working/vipra_qwen3_4b_instruct_2507_5epochs`, rồi dùng `submission.prepare` với deployment mới. Deployment/adapter đang có được giữ để chạy lại checkpoint cũ; registry vẫn nhận đúng model/revision cũ, không gắn adapter đó vào Qwen3.
@@ -144,10 +144,10 @@ Qwen3-4B-Instruct-2507 chỉ hỗ trợ non-thinking; template không tự mở 
 
 ## Đánh giá và độ ổn định
 
-Inference mặc định dùng **beam search**: `beam_width=3`, `self_consistency_samples=1`.
-Transformers dùng `num_beams=3`, còn vLLM dùng `use_beam_search=true` và `n=3`;
-API chọn beam đầu tiên theo điểm log-probability, không bỏ phiếu và không sinh thêm lượt.
-Có thể quay về greedy để đối chiếu bằng cách đặt `beam_width=1`.
+Inference mặc định dùng **greedy**: `beam_width=1`, `self_consistency_samples=1`.
+Transformers/vLLM sinh một chuỗi/câu với `do_sample=false`, `temperature=0` và `top_p=1`;
+không bỏ phiếu và không sinh thêm lượt.
+Beam search có thể bật để đối chiếu bằng cách đặt `beam_width>1`.
 Self-consistency sampling vẫn có thể bật khi đặt đồng thời `beam_width=1` và
 `self_consistency_samples>1`; hai chế độ không chạy cùng lúc.
 `predictions.jsonl`/log API ghi candidate đã chọn và cấu hình decoding.
@@ -157,12 +157,12 @@ Deadline API **55 giây cho toàn bộ request**, không phải 55 giây/mẫu.
 Deadline generation offline áp dụng cho cả batch gồm các ứng viên;
 thời gian báo cáo gồm generation, decode và bỏ phiếu.
 `/healthz` công bố cấu hình decoding để evaluation API phát hiện thay đổi giữa run.
-Checkpoint cũ không có trường `beam_width` sẽ mặc định dùng beam width 3 khi gọi evaluate hoặc prepare.
+Checkpoint cũ không có trường `beam_width` sẽ mặc định dùng greedy khi gọi evaluate hoặc prepare.
 Restart API sau khi đổi config/prompt.
 
 ```bash
-python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_BEAM3 --beam-width 3
 python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_GREEDY --beam-width 1
+python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_BEAM3 --beam-width 3
 python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_SC5 --self-consistency-samples 5
 ```
 
@@ -173,7 +173,7 @@ python -m baseline.evaluate --run-dir RUN_DIR --result-dir RESULTS_SC5 --self-co
 - Run mới phải hiện `train=677, validation(dev)=339`. Nếu còn `608/68` hoặc `676/0`, cập nhật nhánh `Nhotest`, dùng notebook mới và chọn output mới. Evaluate trỏ vào thư mục experiment; nó dùng `RUN_DIR/adapter` của best epoch.
 - `content_exact`: chuỗi đáp án khớp sau NFC/khoảng trắng, đơn vị khớp sau các alias ASCII đã khai báo.
 - `content_tolerant`: cho phép biểu thức số an toàn và `abs(pred-gold) <= atol + rtol*abs(gold)`. Mặc định **rtol=0,05, atol=0**; không coi đáp án rất nhỏ là 0. Dung sai này không phải quy định BTC.
-- `p1_estimate`: content đúng và trả kết quả trong giới hạn thời gian. Mặc định mỗi câu một lượt beam-search generation với 3 beam, không retry. Deadline dừng ở ranh giới token; câu thực tế vượt 60 giây vẫn bị tính sai. Đây là deadline generation, chưa bao gồm thời gian gọi API bên ngoài; một bước GPU đang chạy có thể làm thời gian thực tế vượt deadline.
+- `p1_estimate`: content đúng và trả kết quả trong giới hạn thời gian. Mặc định mỗi câu một lượt greedy generation, không retry. Deadline dừng ở ranh giới token; câu thực tế vượt 60 giây vẫn bị tính sai. Đây là deadline generation, chưa bao gồm thời gian gọi API bên ngoài; một bước GPU đang chạy có thể làm thời gian thực tế vượt deadline.
 
 Kết quả trong thư mục experiment:
 
