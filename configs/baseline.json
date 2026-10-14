@@ -33,7 +33,7 @@
   "loss_chunk_size": 64,
   "log_every": 10,
   "verbose_logging": false,
-  "max_new_tokens": 750,
+  "max_new_tokens": 500,
   "timeout_seconds": 60,
   "rtol": 0.05,
   "atol": 0.0,
