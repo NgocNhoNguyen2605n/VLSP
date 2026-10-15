@@ -11,7 +11,7 @@ def decoding_settings(config):
     """Chuẩn hóa cấu hình decoding dùng chung cho Transformers và vLLM."""
     get = config.get if isinstance(config, Mapping) else lambda key, default: getattr(config, key, default)
     samples = get("self_consistency_samples", 1)
-    beam_width = get("beam_width", 1)
+    beam_width = get("beam_width", 3)
     temperature = get("sampling_temperature", 0.7)
     top_p = get("sampling_top_p", 0.8)
     if type(samples) is not int or samples <= 0:

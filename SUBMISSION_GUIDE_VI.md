@@ -27,7 +27,7 @@ FSDP2 phục vụ training hai GPU. Serving chỉ dùng **một GPU và một ba
 
 Sau khi đổi sang Math-7B, phải train adapter mới và chạy prepare từ run 7B đã hoàn tất; adapter/deployment 3B cũ không tương thích. Trọng số FP16 khoảng 14,19 GiB chưa gồm KV cache/runtime; chọn máy serving đủ VRAM (GPU 24 GiB có nhiều dư địa hơn T4 16 GiB).
 
-Prompt được lấy nguyên từ baseline.data.prompt_messages. Inference mặc định greedy với `beam_width=1`, `self_consistency_samples=1`; vLLM sinh `n=1` trong một request và API không bỏ phiếu. Đặt `beam_width>1` để bật beam search; self-consistency chỉ được bật khi beam width bằng 1. Deadline 55 giây áp dụng cho cả request. vLLM khác Transformers nên không bảo đảm đầu ra giống hệt; đo accuracy và thời gian toàn request trên dev trước khi chấm chính thức.
+Prompt được lấy nguyên từ baseline.data.prompt_messages. Inference mặc định beam search với `beam_width=3`, `self_consistency_samples=1`; vLLM sinh `n=3` trong một request và chọn beam có điểm cao nhất. Đặt `beam_width=1` để dùng greedy; self-consistency chỉ được bật khi beam width bằng 1. Deadline nội bộ 55 giây áp dụng cho cả request để chừa thời gian mạng trong giới hạn 60 giây. vLLM khác Transformers nên không bảo đảm đầu ra giống hệt; đo accuracy và thời gian toàn request trên dev trước khi chấm chính thức.
 
 ## 3. Sau khi train xong: lấy đúng thư mục
 

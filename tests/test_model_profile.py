@@ -59,7 +59,7 @@ class ModelProfileTests(unittest.TestCase):
             provenance = json.loads((output / "provenance.json").read_text())
             self.assertEqual(serving.model_name, BASE_MODEL)
             self.assertEqual(serving.self_consistency_samples, 1)
-            self.assertEqual(serving.beam_width, 1)
+            self.assertEqual(serving.beam_width, 3)
             self.assertEqual(provenance["base_parameters"], BASE_PARAMETERS)
             self.assertEqual(provenance["total_parameters"], BASE_PARAMETERS)
             self.assertLess(provenance["total_parameters"], 8_000_000_000)

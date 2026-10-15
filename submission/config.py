@@ -32,7 +32,7 @@ class ServingConfig:
     request_deadline_seconds: float = 55
     seed: int = 42
     self_consistency_samples: int = 1
-    beam_width: int = 1
+    beam_width: int = 3
     sampling_temperature: float = 0.7
     sampling_top_p: float = 0.8
     max_model_len: int = 4096

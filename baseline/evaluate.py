@@ -227,7 +227,7 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
     if beam_width is not None:
         cfg["beam_width"] = beam_width
     else:
-        cfg.setdefault("beam_width", 1)
+        cfg.setdefault("beam_width", 3)
     for key, value, default in (("self_consistency_samples", self_consistency_samples, 1),
                                 ("sampling_temperature", sampling_temperature, 0.7),
                                 ("sampling_top_p", sampling_top_p, 0.8)):
@@ -288,7 +288,7 @@ def main():
     parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu sampling; chỉ dùng khi beam-width=1")
     parser.add_argument("--sampling-temperature", type=float)
     parser.add_argument("--sampling-top-p", type=float)
-    parser.add_argument("--beam-width", type=int, help="Số beam; mặc định 1 (greedy)")
+    parser.add_argument("--beam-width", type=int, help="Số beam; mặc định 3 (beam search)")
     args = parser.parse_args()
     evaluate(args.run_dir, args.result_dir, args.data_root, args.train_file, args.dev_file,
              args.self_consistency_samples, args.sampling_temperature, args.sampling_top_p,
