@@ -12,6 +12,7 @@ hf_cache/
 /dev_dataset.csv
 !data/train_dataset.csv
 !data/dev_dataset.csv
+/data/reproduction/
 deployment*/
 .venv-serving/
 .venv-api/

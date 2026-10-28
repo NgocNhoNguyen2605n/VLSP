@@ -205,7 +205,7 @@ def evaluate_split(model, tokenizer, rows, split_name, result_dir, cfg, decoding
 
 def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file=None,
              self_consistency_samples=None, sampling_temperature=None, sampling_top_p=None,
-             test_file=None, beam_width=None):
+             test_file=None, beam_width=None, dev_only=False):
     """Chấm dev trước, sau đó chấm test có nhãn nếu có đường dẫn hoặc file tự tìm thấy."""
     run_dir = Path(run_dir)
     if (run_dir / "experiment.json").is_file():
@@ -262,6 +262,9 @@ def evaluate(run_dir, result_dir=None, data_root=None, train_file=None, dev_file
     train_questions = {canonical_text(row["question"]) for row in splits["train"]}
     dev_summary = evaluate_split(model, tokenizer, splits["dev"], "dev", result_dir, cfg, decoding,
                                  train_questions, info)
+    if dev_only:
+        print("Dev-only evaluation: skip test phase (--dev-only).", flush=True)
+        return dev_summary
     test_rows, test_info = load_test_data(cfg, test_file)
     if test_rows is None:
         print("Không tìm thấy test_dataset.csv; bỏ qua phase evaluate test. Dùng --test-file để chỉ rõ file.",
@@ -285,6 +288,7 @@ def main():
     parser.add_argument("--train-file")
     parser.add_argument("--dev-file")
     parser.add_argument("--test-file", help="CSV test có nhãn; sau dev sẽ được chấm ở phase test")
+    parser.add_argument("--dev-only", action="store_true", help="Chỉ chấm dev; không tìm hoặc chấm test")
     parser.add_argument("--self-consistency-samples", type=int, help="Số mẫu sampling; chỉ dùng khi beam-width=1")
     parser.add_argument("--sampling-temperature", type=float)
     parser.add_argument("--sampling-top-p", type=float)
@@ -292,7 +296,7 @@ def main():
     args = parser.parse_args()
     evaluate(args.run_dir, args.result_dir, args.data_root, args.train_file, args.dev_file,
              args.self_consistency_samples, args.sampling_temperature, args.sampling_top_p,
-             args.test_file, args.beam_width)
+             args.test_file, args.beam_width, dev_only=args.dev_only)
 
 
 if __name__ == "__main__":
